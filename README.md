@@ -3,7 +3,7 @@
 A Home Assistant custom integration for controlling BTAlliance/Fulife Telink BLE Mesh lights.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![GitHub Release](https://img.shields.io/github/v/release/archiconda1976/BTAlliance)](https://github.com/archiconda1976/BTAlliance/releases/tag/v0.0.6)
+[![GitHub Release](https://img.shields.io/github/v/release/archiconda1976/BTAlliance)](https://github.com/archiconda1976/BTAlliance/releases/tag/v0.0.7)
 
 ## Features
 
@@ -47,7 +47,7 @@ Devices are identified by:
 6. Search for "BTAlliance Mesh Lights" and click **Download**
 7. Restart Home Assistant
 
-> **Current release**: [v0.0.6](https://github.com/archiconda1976/BTAlliance/releases/tag/v0.0.6)
+> **Current release**: [v0.0.7](https://github.com/archiconda1976/BTAlliance/releases/tag/v0.0.7)
 
 ### Manual Installation
 

@@ -13,6 +13,7 @@ from homeassistant.components.bluetooth import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from bleak_retry_connector import establish_connection, BleakClientWithServiceCache
@@ -24,6 +25,7 @@ from datetime import timedelta
 from .const import (
     DOMAIN,
     CONF_DISCOVERED_LIGHT_MESH_ADDRESSES,
+    CONF_INFRASTRUCTURE_MESH_ADDRESSES,
     SERVICE_UUID, START_SESSION_UUID, NOTIFY_UUID, COMMAND_UUID,
     NOTIFY_STATUS_RESPONSE, NOTIFY_LIGHT_STATUS,
     MAX_CONNECTION_RETRIES, CONNECTION_TIMEOUT, LOGIN_TIMEOUT,
@@ -43,6 +45,7 @@ CONNECT_ATTEMPT_TIMEOUT = 15.0
 COMMAND_BURST_COUNT = 5
 COMMAND_BURST_DELAY = 0.35
 COMMAND_WRITE_WITH_RESPONSE = True
+COMMON_RELAY_MESH_ADDRESSES = {55}
 
 
 def _mac_to_int(mac: str) -> int:
@@ -86,6 +89,7 @@ class BTAllianceMeshCoordinator(DataUpdateCoordinator):
         self.password = password
         self.infrastructure_mesh_addresses = infrastructure_mesh_addresses or set()
         self.cached_light_mesh_addresses = cached_light_mesh_addresses or set()
+        self.cached_light_mesh_addresses.difference_update(self.infrastructure_mesh_addresses)
         self.mac_bytes = gateway_address.to_bytes(6, "little")
         
         # Protocol handler
@@ -151,6 +155,47 @@ class BTAllianceMeshCoordinator(DataUpdateCoordinator):
         options[CONF_DISCOVERED_LIGHT_MESH_ADDRESSES] = value
         self.hass.config_entries.async_update_entry(self.entry, options=options)
 
+    def _persist_infrastructure_addresses(self) -> None:
+        """Persist known infrastructure mesh addresses to the config entry options."""
+        value = ",".join(str(address) for address in sorted(self.infrastructure_mesh_addresses))
+        options = dict(self.entry.options)
+        options[CONF_INFRASTRUCTURE_MESH_ADDRESSES] = value
+        self.hass.config_entries.async_update_entry(self.entry, options=options)
+
+    def add_infrastructure_address(self, mesh_addr: int) -> None:
+        """Remember a mesh infrastructure address across restarts."""
+        if not 1 <= mesh_addr <= 254:
+            return
+
+        is_new = mesh_addr not in self.infrastructure_mesh_addresses
+        self.infrastructure_mesh_addresses.add(mesh_addr)
+        self.infrastructure_states.setdefault(mesh_addr, {'last_seen': None})
+        self.remove_cached_light_address(mesh_addr)
+        self._remove_infrastructure_light_entity(mesh_addr)
+
+        if is_new:
+            self._persist_infrastructure_addresses()
+            _LOGGER.info("Cached BTAlliance mesh infrastructure address %d", mesh_addr)
+
+            if self._new_infrastructure_callback:
+                self._new_infrastructure_callback(mesh_addr)
+
+    def _remove_infrastructure_light_entity(self, mesh_addr: int) -> None:
+        """Remove a light entity registry entry for an address now known as infrastructure."""
+        entity_registry = er.async_get(self.hass)
+        entity_id = entity_registry.async_get_entity_id(
+            "light",
+            DOMAIN,
+            f"{self.entry.entry_id}_{mesh_addr}",
+        )
+        if entity_id:
+            _LOGGER.info(
+                "Removing BTAlliance light entity for infrastructure address %d: %s",
+                mesh_addr,
+                entity_id,
+            )
+            entity_registry.async_remove(entity_id)
+
     def add_cached_light_address(self, mesh_addr: int) -> None:
         """Remember a light mesh address across restarts."""
         if not self._is_controllable_light_address(mesh_addr):
@@ -196,8 +241,23 @@ class BTAllianceMeshCoordinator(DataUpdateCoordinator):
     def _is_controllable_light_address(self, mesh_addr: int) -> bool:
         """Return True if a mesh address should be represented as a light."""
         if self.is_infrastructure_address(mesh_addr):
+            self._remove_infrastructure_light_entity(mesh_addr)
             return False
         return 1 <= mesh_addr <= 254
+
+    @staticmethod
+    def _looks_like_common_relay_status(parsed: dict[str, Any]) -> bool:
+        """Return True if a 0xDC status frame matches the observed Relay-55 pattern."""
+        if parsed['light_addr'] not in COMMON_RELAY_MESH_ADDRESSES:
+            return False
+
+        raw = parsed['raw']
+        return (
+            len(raw) >= 20
+            and raw[12] == 0x00
+            and raw[13] == 0xFF
+            and all(byte == 0x00 for byte in raw[14:20])
+        )
     
     def _process_notification(self, data: bytearray) -> None:
         """Process incoming notification data."""
@@ -237,6 +297,13 @@ class BTAllianceMeshCoordinator(DataUpdateCoordinator):
             light_addr = parsed['light_addr']
             is_on = parsed['is_on']
             luminance = parsed['luminance']
+
+            if self._looks_like_common_relay_status(parsed):
+                _LOGGER.info(
+                    "Mesh address %d looks like a BTAlliance relay; treating it as infrastructure",
+                    light_addr,
+                )
+                self.add_infrastructure_address(light_addr)
 
             if self.is_infrastructure_address(light_addr):
                 is_new_node = light_addr not in self.infrastructure_states
