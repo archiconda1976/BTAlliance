@@ -53,6 +53,8 @@ POLLING_INTERVAL: Final = 60  # seconds between status polling broadcasts
 CONF_MESH_NAME: Final = "mesh_name"
 CONF_PASSWORD: Final = "password"
 CONF_GATEWAY_ADDRESS: Final = "gateway_address"
+CONF_INFRASTRUCTURE_MESH_ADDRESSES: Final = "infrastructure_mesh_addresses"
+CONF_DISCOVERED_LIGHT_MESH_ADDRESSES: Final = "discovered_light_mesh_addresses"
 
 # BLE advertisement matching
 FULIFE_MAC_PREFIXES: Final = ["FF:00:06:0E", "FF:05:01:0B"]

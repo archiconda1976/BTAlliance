@@ -6,6 +6,14 @@ broadcast_turn_off:
   name: Broadcast Turn Off
   description: Turn off all BTAlliance mesh lights with a single mesh broadcast.
 
+broadcast_query_status:
+  name: Broadcast Query Status
+  description: Request status from all BTAlliance mesh lights.
+
+broadcast_sync_time:
+  name: Broadcast Sync Time
+  description: Sync date and time to all BTAlliance mesh lights.
+
 broadcast_set_brightness:
   name: Broadcast Set Brightness
   description: Set brightness for all BTAlliance mesh lights.

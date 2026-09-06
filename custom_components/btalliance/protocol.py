@@ -52,8 +52,8 @@ class TelinkProtocol:
         data[5] = self.target_address[0]
         data[6] = self.target_address[1]
         data[7] = opcode
-	data[8] = (VENDOR_ID >> 8) & 0xFF
-	data[9] = VENDOR_ID & 0xFF
+        data[8] = (VENDOR_ID >> 8) & 0xFF
+        data[9] = VENDOR_ID & 0xFF
         return data
     
     def _encrypt_command(self, data: bytearray) -> bytearray:
@@ -166,7 +166,12 @@ class TelinkProtocol:
             return None
         
         opcode = decrypted[7]
-        result = {'opcode': opcode, 'raw': decrypted}
+        result = {
+            'opcode': opcode,
+            'source': int.from_bytes(decrypted[3:5], "little"),
+            'destination': int.from_bytes(decrypted[5:7], "little"),
+            'raw': decrypted,
+        }
         
         if opcode == NOTIFY_STATUS_RESPONSE:
             result['red'] = decrypted[10]

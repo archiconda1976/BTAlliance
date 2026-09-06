@@ -41,10 +41,11 @@
     "step": {
       "init": {
         "title": "BTAlliance Options",
-        "description": "Update mesh network credentials",
+        "description": "Update mesh network credentials and identify mesh addresses that are infrastructure instead of lights.",
         "data": {
           "mesh_name": "Mesh Name",
-          "password": "Password"
+          "password": "Password",
+          "infrastructure_mesh_addresses": "Infrastructure Mesh Addresses"
         }
       }
     }

@@ -16,11 +16,13 @@ from homeassistant.data_entry_flow import FlowResult
 
 from .const import (
     DOMAIN,
+    CONF_DISCOVERED_LIGHT_MESH_ADDRESSES,
     DEFAULT_MESH_NAME,
     DEFAULT_PASSWORD,
     CONF_MESH_NAME,
     CONF_PASSWORD,
     CONF_GATEWAY_ADDRESS,
+    CONF_INFRASTRUCTURE_MESH_ADDRESSES,
     FULIFE_MAC_PREFIXES,
 )
 
@@ -132,6 +134,9 @@ class BTAllianceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> FlowResult:
         """Handle user-initiated setup."""
         errors: dict[str, str] = {}
+
+        if self._async_current_entries():
+            return self.async_abort(reason="already_configured")
         
         if user_input is not None:
             # Validate and create entry
@@ -173,6 +178,9 @@ class BTAllianceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> FlowResult:
         """Handle device selection."""
         errors: dict[str, str] = {}
+
+        if self._async_current_entries():
+            return self.async_abort(reason="already_configured")
         
         if user_input is not None and CONF_ADDRESS in user_input:
             address = user_input[CONF_ADDRESS]
@@ -256,18 +264,40 @@ class BTAllianceOptionsFlow(config_entries.OptionsFlow):
     ) -> FlowResult:
         """Handle options."""
         if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
+            options = dict(user_input)
+            if CONF_DISCOVERED_LIGHT_MESH_ADDRESSES in self.config_entry.options:
+                options[CONF_DISCOVERED_LIGHT_MESH_ADDRESSES] = (
+                    self.config_entry.options[CONF_DISCOVERED_LIGHT_MESH_ADDRESSES]
+                )
+            return self.async_create_entry(title="", data=options)
+
+        mesh_name = self.config_entry.options.get(
+            CONF_MESH_NAME,
+            self.config_entry.data.get(CONF_MESH_NAME, DEFAULT_MESH_NAME),
+        )
+        password = self.config_entry.options.get(
+            CONF_PASSWORD,
+            self.config_entry.data.get(CONF_PASSWORD, DEFAULT_PASSWORD),
+        )
+        infrastructure_mesh_addresses = self.config_entry.options.get(
+            CONF_INFRASTRUCTURE_MESH_ADDRESSES,
+            self.config_entry.data.get(CONF_INFRASTRUCTURE_MESH_ADDRESSES, ""),
+        )
         
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema({
                 vol.Required(
                     CONF_MESH_NAME,
-                    default=self.config_entry.data.get(CONF_MESH_NAME, DEFAULT_MESH_NAME),
+                    default=mesh_name,
                 ): str,
                 vol.Required(
                     CONF_PASSWORD,
-                    default=self.config_entry.data.get(CONF_PASSWORD, DEFAULT_PASSWORD),
+                    default=password,
+                ): str,
+                vol.Optional(
+                    CONF_INFRASTRUCTURE_MESH_ADDRESSES,
+                    default=infrastructure_mesh_addresses,
                 ): str,
             }),
         )

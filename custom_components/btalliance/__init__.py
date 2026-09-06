@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import voluptuous as vol
 
@@ -13,7 +14,9 @@ from homeassistant.helpers import device_registry as dr
 
 from .const import (
     DOMAIN,
+    CONF_DISCOVERED_LIGHT_MESH_ADDRESSES,
     CONF_GATEWAY_ADDRESS,
+    CONF_INFRASTRUCTURE_MESH_ADDRESSES,
     CONF_MESH_NAME,
     CONF_PASSWORD,
 )
@@ -21,7 +24,7 @@ from .coordinator import BTAllianceMeshCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[Platform] = [Platform.LIGHT]
+PLATFORMS: list[Platform] = [Platform.BINARY_SENSOR, Platform.BUTTON, Platform.LIGHT]
 
 
 BROADCAST_RGB_SCHEMA = vol.Schema({
@@ -37,6 +40,34 @@ BROADCAST_BRIGHTNESS_SCHEMA = vol.Schema({
 BROADCAST_COLOR_TEMP_SCHEMA = vol.Schema({
     vol.Required("color_temp_pct"): vol.All(vol.Coerce(int), vol.Range(min=0, max=100)),
 })
+
+
+def _parse_mesh_addresses(value: Any) -> set[int]:
+    """Parse a list of mesh addresses from config data."""
+    if value is None:
+        return set()
+
+    if isinstance(value, str):
+        raw_parts = value.replace(";", ",").replace(" ", ",").split(",")
+    elif isinstance(value, (list, tuple, set)):
+        raw_parts = list(value)
+    else:
+        raw_parts = [value]
+
+    addresses: set[int] = set()
+    for part in raw_parts:
+        if part in (None, ""):
+            continue
+        try:
+            address = int(str(part).strip())
+        except ValueError:
+            _LOGGER.warning("Ignoring invalid BTAlliance mesh address exclusion: %s", part)
+            continue
+        if 1 <= address <= 254:
+            addresses.add(address)
+        else:
+            _LOGGER.warning("Ignoring out-of-range BTAlliance mesh address: %s", part)
+    return addresses
 
 
 async def _get_coordinator(
@@ -63,14 +94,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _LOGGER.debug("Setting up BTAlliance entry: %s", entry.entry_id)
 
     gateway_address = entry.data[CONF_GATEWAY_ADDRESS]
-    mesh_name = entry.data[CONF_MESH_NAME]
-    password = entry.data[CONF_PASSWORD]
+    mesh_name = entry.options.get(CONF_MESH_NAME, entry.data[CONF_MESH_NAME])
+    password = entry.options.get(CONF_PASSWORD, entry.data[CONF_PASSWORD])
+    infrastructure_mesh_addresses = _parse_mesh_addresses(
+        entry.options.get(
+            CONF_INFRASTRUCTURE_MESH_ADDRESSES,
+            entry.data.get(CONF_INFRASTRUCTURE_MESH_ADDRESSES, ""),
+        )
+    )
+    cached_light_mesh_addresses = _parse_mesh_addresses(
+        entry.options.get(
+            CONF_DISCOVERED_LIGHT_MESH_ADDRESSES,
+            entry.data.get(CONF_DISCOVERED_LIGHT_MESH_ADDRESSES, ""),
+        )
+    )
 
     coordinator = BTAllianceMeshCoordinator(
         hass=hass,
+        entry=entry,
         gateway_address=gateway_address,
         mesh_name=mesh_name,
         password=password,
+        infrastructure_mesh_addresses=infrastructure_mesh_addresses,
+        cached_light_mesh_addresses=cached_light_mesh_addresses,
     )
 
     hass.data.setdefault(DOMAIN, {})
@@ -94,6 +140,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         async def handle_broadcast_turn_off(call: ServiceCall) -> None:
             coordinator = await _get_coordinator(hass, call)
             await coordinator.async_broadcast_turn_off()
+
+        async def handle_broadcast_query_status(call: ServiceCall) -> None:
+            coordinator = await _get_coordinator(hass, call)
+            await coordinator.async_broadcast_query_status()
+
+        async def handle_broadcast_sync_time(call: ServiceCall) -> None:
+            coordinator = await _get_coordinator(hass, call)
+            await coordinator.async_broadcast_sync_time()
 
         async def handle_broadcast_set_brightness(call: ServiceCall) -> None:
             coordinator = await _get_coordinator(hass, call)
@@ -125,6 +179,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             DOMAIN,
             "broadcast_turn_off",
             handle_broadcast_turn_off,
+        )
+
+        hass.services.async_register(
+            DOMAIN,
+            "broadcast_query_status",
+            handle_broadcast_query_status,
+        )
+
+        hass.services.async_register(
+            DOMAIN,
+            "broadcast_sync_time",
+            handle_broadcast_sync_time,
         )
 
         hass.services.async_register(
