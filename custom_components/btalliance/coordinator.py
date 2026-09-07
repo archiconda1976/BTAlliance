@@ -42,7 +42,10 @@ SERVICE_UUID_STR = "00010203-0405-0607-0809-0a0b0c0d1910"
 START_SESSION_UUID_STR = "00010203-0405-0607-0809-0a0b0c0d1914"
 NOTIFY_UUID_STR = "00010203-0405-0607-0809-0a0b0c0d1911"
 COMMAND_UUID_STR = "00010203-0405-0607-0809-0a0b0c0d1912"
-CONNECT_ATTEMPT_TIMEOUT = 15.0
+CONNECT_ATTEMPT_TIMEOUT = 8.0
+MAX_FALLBACK_GATEWAY_CANDIDATES = 4
+MESH_LIGHT_CONFIRMATION_COUNT = 2
+GATEWAY_FAILURE_BACKOFF = 300.0
 COMMAND_BURST_COUNT = 5
 COMMAND_BURST_DELAY = 0.35
 COMMAND_WRITE_WITH_RESPONSE = True
@@ -107,12 +110,14 @@ class BTAllianceMeshCoordinator(DataUpdateCoordinator):
         self.selected_gateway_name: str | None = None
         self.selected_gateway_rssi: int | None = None
         self.gateway_candidates: Dict[str, Dict[str, Any]] = {}
+        self.gateway_candidate_failures: Dict[str, Dict[str, Any]] = {}
         self.start_session_handle: Optional[int] = None
         self.notify_handle: Optional[int] = None
         self.command_handle: Optional[int] = None
         
         # Mesh devices discovered via 0xDC notifications
         self.discovered_devices: Dict[int, Dict[str, Any]] = {}
+        self.pending_discovered_devices: Dict[int, Dict[str, Any]] = {}
         
         # Light state cache per mesh address
         self.light_states: Dict[int, Dict[str, Any]] = {}
@@ -348,7 +353,42 @@ class BTAllianceMeshCoordinator(DataUpdateCoordinator):
                     parsed['raw'].hex(),
                 )
                 return
-            
+
+            if (
+                light_addr not in self.cached_light_mesh_addresses
+                and light_addr not in self.discovered_devices
+            ):
+                pending = self.pending_discovered_devices.setdefault(
+                    light_addr,
+                    {
+                        'sightings': 0,
+                        'first_seen': time.time(),
+                    },
+                )
+                pending['sightings'] += 1
+                pending['last_seen'] = time.time()
+                pending['is_on'] = is_on
+                pending['luminance'] = luminance
+
+                if pending['sightings'] < MESH_LIGHT_CONFIRMATION_COUNT:
+                    _LOGGER.debug(
+                        "Pending mesh light %d seen %d/%d src=%d dst=%d raw=%s",
+                        light_addr,
+                        pending['sightings'],
+                        MESH_LIGHT_CONFIRMATION_COUNT,
+                        parsed['source'],
+                        parsed['destination'],
+                        parsed['raw'].hex(),
+                    )
+                    return
+
+                _LOGGER.info(
+                    "Confirmed mesh light %d after %d sightings",
+                    light_addr,
+                    pending['sightings'],
+                )
+                self.pending_discovered_devices.pop(light_addr, None)
+
             # Check if this is a new device
             is_new_device = light_addr not in self.discovered_devices
             self.add_cached_light_address(light_addr)
@@ -387,6 +427,7 @@ class BTAllianceMeshCoordinator(DataUpdateCoordinator):
     def _candidate_gateway_addresses(self) -> list[str]:
         """Return configured gateway first, then other discovered Fulife nodes."""
         configured_mac = self._format_mac(self.gateway_address)
+        now = time.time()
         candidates: dict[str, int] = {configured_mac: 0}
         candidate_info: dict[str, dict[str, Any]] = {
             configured_mac: {
@@ -394,6 +435,7 @@ class BTAllianceMeshCoordinator(DataUpdateCoordinator):
                 "name": None,
                 "rssi": None,
                 "configured": True,
+                "last_failure": self.gateway_candidate_failures.get(configured_mac),
             }
         }
 
@@ -408,17 +450,46 @@ class BTAllianceMeshCoordinator(DataUpdateCoordinator):
                 "name": service_info.name,
                 "rssi": service_info.rssi,
                 "configured": service_info.address == configured_mac,
+                "last_failure": self.gateway_candidate_failures.get(service_info.address),
             }
 
         self.gateway_candidates = candidate_info
+        candidates_to_try = [
+            address
+            for address in candidates
+            if (
+                address == configured_mac
+                or now - self.gateway_candidate_failures.get(address, {}).get("time", 0)
+                >= GATEWAY_FAILURE_BACKOFF
+            )
+        ]
 
-        return sorted(
-            candidates,
+        sorted_candidates = sorted(
+            candidates_to_try,
             key=lambda address: (
                 address != configured_mac,
                 -(candidates[address] or -999),
             ),
         )
+
+        if configured_mac in sorted_candidates:
+            fallback_candidates = [
+                address for address in sorted_candidates if address != configured_mac
+            ][:MAX_FALLBACK_GATEWAY_CANDIDATES]
+            return [configured_mac, *fallback_candidates]
+
+        return sorted_candidates[:MAX_FALLBACK_GATEWAY_CANDIDATES]
+
+    def _mark_gateway_candidate_failed(self, mac_str: str, reason: str) -> None:
+        """Remember a failed candidate briefly so retries can try other devices."""
+        self.gateway_candidate_failures[mac_str] = {
+            "time": time.time(),
+            "reason": reason,
+        }
+
+    def _clear_gateway_candidate_failure(self, mac_str: str) -> None:
+        """Clear any remembered failure for a successful candidate."""
+        self.gateway_candidate_failures.pop(mac_str, None)
     
     async def async_connect(self) -> bool:
         """Connect to the gateway device and establish session."""
@@ -459,10 +530,12 @@ class BTAllianceMeshCoordinator(DataUpdateCoordinator):
                     self.protocol = TelinkProtocol(self.mac_bytes, self.mesh_name, self.password)
                     _LOGGER.info("Connected to gateway candidate: %s", self.ble_device.address)
                     if await self._async_setup_session():
+                        self._clear_gateway_candidate_failure(mac_str)
                         self._notify_state_change(BROADCAST_ADDRESS)
                         return True
 
                     _LOGGER.warning("Gateway candidate %s failed session setup", mac_str)
+                    self._mark_gateway_candidate_failed(mac_str, "session_setup_failed")
                     await self.async_disconnect()
                 except TimeoutError:
                     _LOGGER.warning(
@@ -470,10 +543,13 @@ class BTAllianceMeshCoordinator(DataUpdateCoordinator):
                         mac_str,
                         CONNECT_ATTEMPT_TIMEOUT,
                     )
+                    self._mark_gateway_candidate_failed(mac_str, "connect_timeout")
                 except BleakError as e:
                     _LOGGER.warning("Failed to connect to gateway candidate %s: %s", mac_str, e)
+                    self._mark_gateway_candidate_failed(mac_str, str(e))
                 except Exception as e:
                     _LOGGER.warning("Unexpected connection error for gateway candidate %s: %s", mac_str, e)
+                    self._mark_gateway_candidate_failed(mac_str, str(e))
 
             _LOGGER.error("Failed to connect to any usable Fulife gateway candidate")
             return False
