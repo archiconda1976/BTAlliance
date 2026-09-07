@@ -17,6 +17,7 @@ from homeassistant.components.light import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -35,6 +36,9 @@ async def async_setup_entry(
     """Set up BTAlliance lights from a config entry."""
     coordinator: BTAllianceMeshCoordinator = hass.data[DOMAIN][entry.entry_id]
     mesh_name = entry.data.get(CONF_MESH_NAME, "Fulife")
+    device_registry = dr.async_get(hass)
+    hub_device = device_registry.async_get_device(identifiers={(DOMAIN, entry.entry_id)})
+    hub_device_id = hub_device.id if hub_device else None
     
     # Track which mesh addresses have entities
     known_addresses: set[int] = set()
@@ -77,6 +81,7 @@ async def async_setup_entry(
                 mesh_addr=mesh_addr,
                 mesh_name=mesh_name,
                 entry_id=entry.entry_id,
+                hub_device_id=hub_device_id,
             )
         ])
     
@@ -155,6 +160,7 @@ class BTAllianceMeshLight(CoordinatorEntity, LightEntity):
         mesh_addr: int,
         mesh_name: str,
         entry_id: str,
+        hub_device_id: str | None,
     ) -> None:
         """Initialize the light."""
         super().__init__(coordinator)
@@ -168,13 +174,15 @@ class BTAllianceMeshLight(CoordinatorEntity, LightEntity):
         self._attr_name = f"Light {mesh_addr}"
         
         # Device info - group all lights under the mesh network
-        self._attr_device_info = DeviceInfo(
+        device_info = DeviceInfo(
             identifiers={(DOMAIN, f"{entry_id}_{mesh_addr}")},
             name=f"{mesh_name} Light {mesh_addr}",
             manufacturer="BTAlliance/Fulife",
             model="Telink BLE Mesh Light",
-            via_device=(DOMAIN, entry_id),
         )
+        if hub_device_id:
+            device_info["via_device_id"] = hub_device_id
+        self._attr_device_info = device_info
         
         # Register for state updates
         coordinator.register_state_callback(mesh_addr, self._handle_state_update)

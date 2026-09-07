@@ -12,6 +12,7 @@ from homeassistant.components.binary_sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo, EntityCategory
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -31,6 +32,9 @@ async def async_setup_entry(
     """Set up BTAlliance infrastructure diagnostic entities."""
     coordinator: BTAllianceMeshCoordinator = hass.data[DOMAIN][entry.entry_id]
     mesh_name = entry.options.get(CONF_MESH_NAME, entry.data.get(CONF_MESH_NAME, "Fulife"))
+    device_registry = dr.async_get(hass)
+    hub_device = device_registry.async_get_device(identifiers={(DOMAIN, entry.entry_id)})
+    hub_device_id = hub_device.id if hub_device else None
     known_addresses: set[int] = set()
     entities: list[BinarySensorEntity] = [
         BTAllianceMeshHubDiagnostics(
@@ -53,6 +57,7 @@ async def async_setup_entry(
                 mesh_addr=mesh_addr,
                 mesh_name=mesh_name,
                 entry_id=entry.entry_id,
+                hub_device_id=hub_device_id,
             )
         ])
 
@@ -68,6 +73,7 @@ async def async_setup_entry(
                     mesh_addr=mesh_addr,
                     mesh_name=mesh_name,
                     entry_id=entry.entry_id,
+                    hub_device_id=hub_device_id,
                 )
             )
 
@@ -136,6 +142,7 @@ class BTAllianceMeshInfrastructureNode(CoordinatorEntity, BinarySensorEntity):
         mesh_addr: int,
         mesh_name: str,
         entry_id: str,
+        hub_device_id: str | None,
     ) -> None:
         """Initialize the infrastructure diagnostic entity."""
         super().__init__(coordinator)
@@ -143,13 +150,15 @@ class BTAllianceMeshInfrastructureNode(CoordinatorEntity, BinarySensorEntity):
         self._mesh_addr = mesh_addr
         self._attr_unique_id = f"{entry_id}_infrastructure_{mesh_addr}"
         self._attr_name = f"Mesh Node {mesh_addr}"
-        self._attr_device_info = DeviceInfo(
+        device_info = DeviceInfo(
             identifiers={(DOMAIN, f"{entry_id}_infrastructure_{mesh_addr}")},
             name=f"{mesh_name} Mesh Node {mesh_addr}",
             manufacturer="BTAlliance/Fulife",
             model="Telink BLE Mesh Infrastructure Node",
-            via_device=(DOMAIN, entry_id),
         )
+        if hub_device_id:
+            device_info["via_device_id"] = hub_device_id
+        self._attr_device_info = device_info
 
         coordinator.register_state_callback(mesh_addr, self._handle_state_update)
 
