@@ -23,6 +23,7 @@ from .const import (
     CONF_PASSWORD,
     CONF_GATEWAY_ADDRESS,
     CONF_INFRASTRUCTURE_MESH_ADDRESSES,
+    CONF_CLEANUP_UNVALIDATED_LIGHTS,
     FULIFE_MAC_PREFIXES,
 )
 
@@ -265,10 +266,23 @@ class BTAllianceOptionsFlow(config_entries.OptionsFlow):
         """Handle options."""
         if user_input is not None:
             options = dict(user_input)
+            cleanup_unvalidated_lights = bool(
+                options.pop(CONF_CLEANUP_UNVALIDATED_LIGHTS, False)
+            )
             if CONF_DISCOVERED_LIGHT_MESH_ADDRESSES in self.config_entry.options:
                 options[CONF_DISCOVERED_LIGHT_MESH_ADDRESSES] = (
                     self.config_entry.options[CONF_DISCOVERED_LIGHT_MESH_ADDRESSES]
                 )
+            if cleanup_unvalidated_lights:
+                coordinator = self.hass.data.get(DOMAIN, {}).get(
+                    self.config_entry.entry_id
+                )
+                if coordinator is not None:
+                    coordinator.cleanup_cached_light_addresses()
+                    options[CONF_DISCOVERED_LIGHT_MESH_ADDRESSES] = ",".join(
+                        str(address)
+                        for address in sorted(coordinator.cached_light_mesh_addresses)
+                    )
             return self.async_create_entry(title="", data=options)
 
         mesh_name = self.config_entry.options.get(
@@ -299,5 +313,9 @@ class BTAllianceOptionsFlow(config_entries.OptionsFlow):
                     CONF_INFRASTRUCTURE_MESH_ADDRESSES,
                     default=infrastructure_mesh_addresses,
                 ): str,
+                vol.Optional(
+                    CONF_CLEANUP_UNVALIDATED_LIGHTS,
+                    default=False,
+                ): bool,
             }),
         )

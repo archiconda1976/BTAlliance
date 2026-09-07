@@ -14,6 +14,7 @@ from homeassistant.components.bluetooth import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
@@ -45,6 +46,8 @@ COMMAND_UUID_STR = "00010203-0405-0607-0809-0a0b0c0d1912"
 CONNECT_ATTEMPT_TIMEOUT = 8.0
 MAX_FALLBACK_GATEWAY_CANDIDATES = 4
 MESH_LIGHT_CONFIRMATION_COUNT = 2
+MAX_DISCOVERY_VALIDATION_TASKS = 3
+DISCOVERY_VALIDATION_COOLDOWN = 120.0
 GATEWAY_FAILURE_BACKOFF = 300.0
 COMMAND_BURST_COUNT = 5
 COMMAND_BURST_DELAY = 0.35
@@ -118,6 +121,8 @@ class BTAllianceMeshCoordinator(DataUpdateCoordinator):
         # Mesh devices discovered via 0xDC notifications
         self.discovered_devices: Dict[int, Dict[str, Any]] = {}
         self.pending_discovered_devices: Dict[int, Dict[str, Any]] = {}
+        self.validated_light_mesh_addresses: set[int] = set()
+        self._discovery_validation_tasks: set[asyncio.Task] = set()
         
         # Light state cache per mesh address
         self.light_states: Dict[int, Dict[str, Any]] = {}
@@ -217,6 +222,75 @@ class BTAllianceMeshCoordinator(DataUpdateCoordinator):
         self._persist_cached_light_addresses()
         _LOGGER.info("Cached BTAlliance mesh light address %d", mesh_addr)
 
+    def _confirm_light_address(self, mesh_addr: int, state: Dict[str, Any], reason: str) -> None:
+        """Confirm a mesh address as a controllable light."""
+        if not self._is_controllable_light_address(mesh_addr):
+            return
+
+        was_cached = mesh_addr in self.cached_light_mesh_addresses
+        is_new_device = mesh_addr not in self.discovered_devices and not was_cached
+        self.pending_discovered_devices.pop(mesh_addr, None)
+        self.validated_light_mesh_addresses.add(mesh_addr)
+        self.add_cached_light_address(mesh_addr)
+        self.discovered_devices[mesh_addr] = state
+        self.light_states[mesh_addr] = state
+
+        _LOGGER.info("Confirmed mesh light %d from %s", mesh_addr, reason)
+        if is_new_device and self._new_device_callback:
+            _LOGGER.info("New mesh device discovered: %d", mesh_addr)
+            self._new_device_callback(mesh_addr)
+
+        self._notify_state_change(mesh_addr)
+
+    async def _async_validate_pending_light(self, mesh_addr: int) -> None:
+        """Ask a pending mesh address for full status before creating an entity."""
+        try:
+            _LOGGER.debug(
+                "Validating pending mesh light %d with direct status query",
+                mesh_addr,
+            )
+            await self.async_query_status(mesh_addr)
+            await asyncio.sleep(1.0)
+            if mesh_addr not in self.discovered_devices:
+                _LOGGER.debug(
+                    "Pending mesh light %d did not answer direct status query",
+                    mesh_addr,
+                )
+        finally:
+            pending = self.pending_discovered_devices.get(mesh_addr)
+            if pending:
+                pending.pop('validating', None)
+            task = asyncio.current_task()
+            if task is not None:
+                self._discovery_validation_tasks.discard(task)
+
+    def _schedule_pending_light_validation(self, mesh_addr: int) -> None:
+        """Schedule bounded validation for a pending mesh light address."""
+        pending = self.pending_discovered_devices.get(mesh_addr)
+        if not pending or pending.get('validating'):
+            return
+
+        now = time.time()
+        last_validation = pending.get('last_validation', 0)
+        if now - last_validation < DISCOVERY_VALIDATION_COOLDOWN:
+            _LOGGER.debug(
+                "Pending mesh light %d was recently validated; leaving pending",
+                mesh_addr,
+            )
+            return
+
+        if len(self._discovery_validation_tasks) >= MAX_DISCOVERY_VALIDATION_TASKS:
+            _LOGGER.debug(
+                "Discovery validation queue full; leaving mesh light %d pending",
+                mesh_addr,
+            )
+            return
+
+        pending['validating'] = True
+        pending['last_validation'] = now
+        task = self.hass.async_create_task(self._async_validate_pending_light(mesh_addr))
+        self._discovery_validation_tasks.add(task)
+
     def remove_cached_light_address(self, mesh_addr: int) -> None:
         """Forget a light mesh address after the entity is removed."""
         if mesh_addr not in self.cached_light_mesh_addresses:
@@ -224,9 +298,63 @@ class BTAllianceMeshCoordinator(DataUpdateCoordinator):
 
         self.cached_light_mesh_addresses.remove(mesh_addr)
         self.discovered_devices.pop(mesh_addr, None)
+        self.validated_light_mesh_addresses.discard(mesh_addr)
         self.light_states.pop(mesh_addr, None)
         self._persist_cached_light_addresses()
         _LOGGER.info("Removed BTAlliance mesh light address %d from cache", mesh_addr)
+
+    def _remove_light_entity_and_device(self, mesh_addr: int) -> None:
+        """Remove Home Assistant registry entries for a light mesh address."""
+        unique_id = f"{self.entry.entry_id}_{mesh_addr}"
+        entity_registry = er.async_get(self.hass)
+        entity_id = entity_registry.async_get_entity_id("light", DOMAIN, unique_id)
+        if entity_id:
+            _LOGGER.info(
+                "Removing BTAlliance light entity for mesh address %d: %s",
+                mesh_addr,
+                entity_id,
+            )
+            entity_registry.async_remove(entity_id)
+
+        device_registry = dr.async_get(self.hass)
+        device = device_registry.async_get_device(identifiers={(DOMAIN, unique_id)})
+        if device:
+            _LOGGER.info(
+                "Removing BTAlliance light device for mesh address %d: %s",
+                mesh_addr,
+                device.id,
+            )
+            device_registry.async_remove_device(device.id)
+
+    def cleanup_cached_light_addresses(
+        self,
+        keep_addresses: set[int] | None = None,
+        require_validation: bool = True,
+    ) -> list[int]:
+        """Remove cached lights that were not confirmed as real mesh lights."""
+        keep = set(keep_addresses or set())
+        keep.difference_update(self.infrastructure_mesh_addresses)
+
+        if require_validation:
+            keep.update(self.validated_light_mesh_addresses)
+        else:
+            keep.update(self.discovered_devices)
+
+        remove_addresses = sorted(self.cached_light_mesh_addresses - keep)
+        for mesh_addr in remove_addresses:
+            self.remove_cached_light_address(mesh_addr)
+            self._remove_light_entity_and_device(mesh_addr)
+
+        if remove_addresses:
+            _LOGGER.info(
+                "Cleaned up %d unvalidated BTAlliance mesh light addresses: %s",
+                len(remove_addresses),
+                remove_addresses,
+            )
+        else:
+            _LOGGER.info("No unvalidated BTAlliance mesh light addresses to clean up")
+
+        return remove_addresses
     
     def register_state_callback(self, mesh_addr: int, callback: Callable) -> None:
         """Register callback for state updates for a specific mesh address."""
@@ -292,9 +420,35 @@ class BTAllianceMeshCoordinator(DataUpdateCoordinator):
         opcode = parsed['opcode']
         
         if opcode == NOTIFY_STATUS_RESPONSE:
-            # Full status response (0xDB) - update state for current target
+            # Full status response (0xDB)
             target_addr = self.protocol.get_target_address()
-            self.light_states[target_addr] = {
+            source_addr = parsed['source']
+            response_addr = source_addr if 1 <= source_addr <= 254 else target_addr
+
+            if target_addr != BROADCAST_ADDRESS and response_addr != target_addr:
+                _LOGGER.debug(
+                    "Ignoring 0xDB status for source %d while querying addr %d raw=%s",
+                    response_addr,
+                    target_addr,
+                    parsed['raw'].hex(),
+                )
+                return
+
+            if self.is_infrastructure_address(response_addr):
+                self.infrastructure_states[response_addr] = {'last_seen': time.time()}
+                self._notify_state_change(response_addr)
+                return
+
+            if not self._is_controllable_light_address(response_addr):
+                _LOGGER.debug(
+                    "Ignoring 0xDB status for non-light source %d target=%d raw=%s",
+                    response_addr,
+                    target_addr,
+                    parsed['raw'].hex(),
+                )
+                return
+
+            state = {
                 'is_on': parsed['is_on'],
                 'luminance': parsed['luminance'],
                 'red': parsed['red'],
@@ -308,13 +462,31 @@ class BTAllianceMeshCoordinator(DataUpdateCoordinator):
                 else 'color_temp',
                 'last_seen': time.time(),
             }
+            self.validated_light_mesh_addresses.add(response_addr)
+            self.light_states[response_addr] = state
             _LOGGER.debug(
-                "0xDB status for addr %d: on=%s lum=%d RGB=(%d,%d,%d) CT=%d warm=%d cool=%d raw=%s",
-                          target_addr, parsed['is_on'], parsed['luminance'],
+                "0xDB status for addr %d target=%d: on=%s lum=%d RGB=(%d,%d,%d) CT=%d warm=%d cool=%d raw=%s",
+                          response_addr, target_addr, parsed['is_on'], parsed['luminance'],
                           parsed['red'], parsed['green'], parsed['blue'],
                           parsed['color_temp'], parsed['warm'], parsed['cool'],
                           parsed['raw'].hex())
-            self._notify_state_change(target_addr)
+            if (
+                response_addr in self.pending_discovered_devices
+                or response_addr not in self.discovered_devices
+            ):
+                self._confirm_light_address(
+                    response_addr,
+                    state,
+                    "broadcast status response"
+                    if target_addr == BROADCAST_ADDRESS
+                    else "direct status response",
+                )
+                return
+
+            if response_addr in self.cached_light_mesh_addresses:
+                self.discovered_devices[response_addr] = state
+
+            self._notify_state_change(response_addr)
             
         elif opcode == NOTIFY_LIGHT_STATUS:
             # Mesh broadcast status (0xDC)
@@ -383,23 +555,21 @@ class BTAllianceMeshCoordinator(DataUpdateCoordinator):
                     return
 
                 _LOGGER.info(
-                    "Confirmed mesh light %d after %d sightings",
+                    "Mesh light %d seen %d times; validating before creating entity",
                     light_addr,
                     pending['sightings'],
                 )
-                self.pending_discovered_devices.pop(light_addr, None)
+                self._schedule_pending_light_validation(light_addr)
+                return
 
-            # Check if this is a new device
-            is_new_device = light_addr not in self.discovered_devices
-            self.add_cached_light_address(light_addr)
-            
-            # Track discovered device
-            self.discovered_devices[light_addr] = {
+            state = {
                 'is_on': is_on,
                 'luminance': luminance,
                 'last_seen': time.time()
             }
-            
+            if light_addr in self.cached_light_mesh_addresses:
+                self.discovered_devices[light_addr] = state
+
             # Update light state if we have it
             if light_addr in self.light_states:
                 self.light_states[light_addr]['is_on'] = is_on
@@ -414,14 +584,9 @@ class BTAllianceMeshCoordinator(DataUpdateCoordinator):
             
             _LOGGER.debug("0xDC mesh: light=%d %s lum=%d src=%d dst=%d raw=%s (total: %d devices)",
                          light_addr, "ON" if is_on else "OFF", luminance,
-                         parsed['source'], parsed['destination'], parsed['raw'].hex(),
-                         len(self.discovered_devices))
-            
-            # Notify about new device discovery
-            if is_new_device and self._new_device_callback:
-                _LOGGER.info("New mesh device discovered: %d", light_addr)
-                self._new_device_callback(light_addr)
-            
+                          parsed['source'], parsed['destination'], parsed['raw'].hex(),
+                          len(self.discovered_devices))
+
             self._notify_state_change(light_addr)
 
     def _candidate_gateway_addresses(self) -> list[str]:

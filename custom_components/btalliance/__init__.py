@@ -41,6 +41,12 @@ BROADCAST_COLOR_TEMP_SCHEMA = vol.Schema({
     vol.Required("color_temp_pct"): vol.All(vol.Coerce(int), vol.Range(min=0, max=100)),
 })
 
+CLEANUP_DISCOVERED_LIGHTS_SCHEMA = vol.Schema({
+    vol.Optional("entry_id"): str,
+    vol.Optional("keep_addresses", default=""): str,
+    vol.Optional("require_validation", default=True): bool,
+})
+
 
 def _parse_mesh_addresses(value: Any) -> set[int]:
     """Parse a list of mesh addresses from config data."""
@@ -131,7 +137,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         model="Telink BLE Mesh Gateway",
     )
 
-    if not hass.services.has_service(DOMAIN, "broadcast_turn_on"):
+    if (
+        not hass.services.has_service(DOMAIN, "broadcast_turn_on")
+        or not hass.services.has_service(DOMAIN, "cleanup_discovered_lights")
+    ):
 
         async def handle_broadcast_turn_on(call: ServiceCall) -> None:
             coordinator = await _get_coordinator(hass, call)
@@ -169,50 +178,77 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 call.data["color_temp_pct"]
             )
 
-        hass.services.async_register(
-            DOMAIN,
-            "broadcast_turn_on",
-            handle_broadcast_turn_on,
-        )
+        async def handle_cleanup_discovered_lights(call: ServiceCall) -> None:
+            coordinator = await _get_coordinator(hass, call)
+            keep_addresses = _parse_mesh_addresses(call.data.get("keep_addresses", ""))
+            removed = coordinator.cleanup_cached_light_addresses(
+                keep_addresses=keep_addresses,
+                require_validation=call.data["require_validation"],
+            )
+            _LOGGER.info(
+                "BTAlliance cleanup_discovered_lights removed %d addresses",
+                len(removed),
+            )
 
-        hass.services.async_register(
-            DOMAIN,
-            "broadcast_turn_off",
-            handle_broadcast_turn_off,
-        )
+        if not hass.services.has_service(DOMAIN, "broadcast_turn_on"):
+            hass.services.async_register(
+                DOMAIN,
+                "broadcast_turn_on",
+                handle_broadcast_turn_on,
+            )
 
-        hass.services.async_register(
-            DOMAIN,
-            "broadcast_query_status",
-            handle_broadcast_query_status,
-        )
+        if not hass.services.has_service(DOMAIN, "broadcast_turn_off"):
+            hass.services.async_register(
+                DOMAIN,
+                "broadcast_turn_off",
+                handle_broadcast_turn_off,
+            )
 
-        hass.services.async_register(
-            DOMAIN,
-            "broadcast_sync_time",
-            handle_broadcast_sync_time,
-        )
+        if not hass.services.has_service(DOMAIN, "broadcast_query_status"):
+            hass.services.async_register(
+                DOMAIN,
+                "broadcast_query_status",
+                handle_broadcast_query_status,
+            )
 
-        hass.services.async_register(
-            DOMAIN,
-            "broadcast_set_brightness",
-            handle_broadcast_set_brightness,
-            schema=BROADCAST_BRIGHTNESS_SCHEMA,
-        )
+        if not hass.services.has_service(DOMAIN, "broadcast_sync_time"):
+            hass.services.async_register(
+                DOMAIN,
+                "broadcast_sync_time",
+                handle_broadcast_sync_time,
+            )
 
-        hass.services.async_register(
-            DOMAIN,
-            "broadcast_set_rgb",
-            handle_broadcast_set_rgb,
-            schema=BROADCAST_RGB_SCHEMA,
-        )
+        if not hass.services.has_service(DOMAIN, "broadcast_set_brightness"):
+            hass.services.async_register(
+                DOMAIN,
+                "broadcast_set_brightness",
+                handle_broadcast_set_brightness,
+                schema=BROADCAST_BRIGHTNESS_SCHEMA,
+            )
 
-        hass.services.async_register(
-            DOMAIN,
-            "broadcast_set_color_temp",
-            handle_broadcast_set_color_temp,
-            schema=BROADCAST_COLOR_TEMP_SCHEMA,
-        )
+        if not hass.services.has_service(DOMAIN, "broadcast_set_rgb"):
+            hass.services.async_register(
+                DOMAIN,
+                "broadcast_set_rgb",
+                handle_broadcast_set_rgb,
+                schema=BROADCAST_RGB_SCHEMA,
+            )
+
+        if not hass.services.has_service(DOMAIN, "broadcast_set_color_temp"):
+            hass.services.async_register(
+                DOMAIN,
+                "broadcast_set_color_temp",
+                handle_broadcast_set_color_temp,
+                schema=BROADCAST_COLOR_TEMP_SCHEMA,
+            )
+
+        if not hass.services.has_service(DOMAIN, "cleanup_discovered_lights"):
+            hass.services.async_register(
+                DOMAIN,
+                "cleanup_discovered_lights",
+                handle_cleanup_discovered_lights,
+                schema=CLEANUP_DISCOVERED_LIGHTS_SCHEMA,
+            )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 

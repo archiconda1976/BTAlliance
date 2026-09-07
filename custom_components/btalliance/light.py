@@ -192,8 +192,7 @@ class BTAllianceMeshLight(CoordinatorEntity, LightEntity):
         self.coordinator.unregister_state_callback(self._mesh_addr, self._handle_state_update)
         await super().async_will_remove_from_hass()
 
-    @callback
-    def async_removed_from_registry(self) -> None:
+    async def async_removed_from_registry(self) -> None:
         """Handle manual removal from the entity registry."""
         self.coordinator.remove_cached_light_address(self._mesh_addr)
     
@@ -327,8 +326,7 @@ class BTAllianceBroadcastLight(BTAllianceMeshLight):
 
         coordinator.register_state_callback(BROADCAST_ADDRESS, self._handle_state_update)
 
-    @callback
-    def async_removed_from_registry(self) -> None:
+    async def async_removed_from_registry(self) -> None:
         """Handle manual removal from the entity registry."""
 
     @property
