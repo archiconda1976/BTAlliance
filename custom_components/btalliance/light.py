@@ -181,7 +181,7 @@ class BTAllianceMeshLight(CoordinatorEntity, LightEntity):
     
     async def async_will_remove_from_hass(self) -> None:
         """Handle removal from hass."""
-        self.coordinator.unregister_state_callback(self._mesh_addr)
+        self.coordinator.unregister_state_callback(self._mesh_addr, self._handle_state_update)
         await super().async_will_remove_from_hass()
 
     @callback

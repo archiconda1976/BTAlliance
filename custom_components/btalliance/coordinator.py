@@ -1,6 +1,7 @@
 """Coordinator for BTAlliance mesh device management."""
 
 import asyncio
+import contextlib
 import logging
 import os
 import time
@@ -102,6 +103,10 @@ class BTAllianceMeshCoordinator(DataUpdateCoordinator):
         self.login_valid = False
         self.ble_device = None
         self.client = None
+        self.selected_gateway_address: str | None = None
+        self.selected_gateway_name: str | None = None
+        self.selected_gateway_rssi: int | None = None
+        self.gateway_candidates: Dict[str, Dict[str, Any]] = {}
         self.start_session_handle: Optional[int] = None
         self.notify_handle: Optional[int] = None
         self.command_handle: Optional[int] = None
@@ -118,7 +123,7 @@ class BTAllianceMeshCoordinator(DataUpdateCoordinator):
         }
         
         # Callbacks for state updates
-        self._state_callbacks: Dict[int, Callable] = {}
+        self._state_callbacks: Dict[int, list[Callable]] = {}
         
         # Discovery event
         self._discovery_complete = asyncio.Event()
@@ -220,19 +225,33 @@ class BTAllianceMeshCoordinator(DataUpdateCoordinator):
     
     def register_state_callback(self, mesh_addr: int, callback: Callable) -> None:
         """Register callback for state updates for a specific mesh address."""
-        self._state_callbacks[mesh_addr] = callback
+        self._state_callbacks.setdefault(mesh_addr, []).append(callback)
     
-    def unregister_state_callback(self, mesh_addr: int) -> None:
+    def unregister_state_callback(self, mesh_addr: int, callback: Callable | None = None) -> None:
         """Unregister state callback."""
-        self._state_callbacks.pop(mesh_addr, None)
+        if callback is None:
+            self._state_callbacks.pop(mesh_addr, None)
+            return
+
+        callbacks = self._state_callbacks.get(mesh_addr)
+        if not callbacks:
+            return
+
+        with contextlib.suppress(ValueError):
+            callbacks.remove(callback)
+
+        if not callbacks:
+            self._state_callbacks.pop(mesh_addr, None)
     
     def _notify_state_change(self, mesh_addr: int) -> None:
         """Notify registered callback of state change."""
-        if mesh_addr in self._state_callbacks:
-            self._state_callbacks[mesh_addr]()
+        callbacks = list(self._state_callbacks.get(mesh_addr, []))
         # Also notify broadcast listeners
-        if BROADCAST_ADDRESS in self._state_callbacks:
-            self._state_callbacks[BROADCAST_ADDRESS]()
+        if mesh_addr != BROADCAST_ADDRESS:
+            callbacks.extend(self._state_callbacks.get(BROADCAST_ADDRESS, []))
+
+        for callback in callbacks:
+            callback()
 
     def is_infrastructure_address(self, mesh_addr: int) -> bool:
         """Return True if a mesh address is infrastructure, not a light."""
@@ -369,6 +388,14 @@ class BTAllianceMeshCoordinator(DataUpdateCoordinator):
         """Return configured gateway first, then other discovered Fulife nodes."""
         configured_mac = self._format_mac(self.gateway_address)
         candidates: dict[str, int] = {configured_mac: 0}
+        candidate_info: dict[str, dict[str, Any]] = {
+            configured_mac: {
+                "address": configured_mac,
+                "name": None,
+                "rssi": None,
+                "configured": True,
+            }
+        }
 
         for service_info in bluetooth.async_discovered_service_info(self.hass):
             if not _is_fulife_service_info(service_info):
@@ -376,6 +403,14 @@ class BTAllianceMeshCoordinator(DataUpdateCoordinator):
 
             rssi = service_info.rssi or -999
             candidates.setdefault(service_info.address, rssi)
+            candidate_info[service_info.address] = {
+                "address": service_info.address,
+                "name": service_info.name,
+                "rssi": service_info.rssi,
+                "configured": service_info.address == configured_mac,
+            }
+
+        self.gateway_candidates = candidate_info
 
         return sorted(
             candidates,
@@ -417,10 +452,14 @@ class BTAllianceMeshCoordinator(DataUpdateCoordinator):
                             disconnected_callback=self._on_disconnect,
                         )
                     self.connected = True
+                    self.selected_gateway_address = mac_str
+                    self.selected_gateway_name = self.gateway_candidates.get(mac_str, {}).get("name")
+                    self.selected_gateway_rssi = self.gateway_candidates.get(mac_str, {}).get("rssi")
                     self.mac_bytes = _mac_to_int(mac_str).to_bytes(6, "little")
                     self.protocol = TelinkProtocol(self.mac_bytes, self.mesh_name, self.password)
                     _LOGGER.info("Connected to gateway candidate: %s", self.ble_device.address)
                     if await self._async_setup_session():
+                        self._notify_state_change(BROADCAST_ADDRESS)
                         return True
 
                     _LOGGER.warning("Gateway candidate %s failed session setup", mac_str)
@@ -502,6 +541,7 @@ class BTAllianceMeshCoordinator(DataUpdateCoordinator):
         _LOGGER.warning("Disconnected from gateway")
         self.connected = False
         self.login_valid = False
+        self._notify_state_change(BROADCAST_ADDRESS)
     
     def _on_notification(self, sender, data: bytearray) -> None:
         """Handle incoming BLE notification."""
@@ -515,7 +555,11 @@ class BTAllianceMeshCoordinator(DataUpdateCoordinator):
         self.client = None
         self.connected = False
         self.login_valid = False
+        self.selected_gateway_address = None
+        self.selected_gateway_name = None
+        self.selected_gateway_rssi = None
         _LOGGER.debug("Disconnected from gateway")
+        self._notify_state_change(BROADCAST_ADDRESS)
     
     async def async_discover_mesh_devices(self, timeout: float = MESH_DISCOVERY_TIMEOUT) -> Dict[int, Dict]:
         """Discover mesh devices by sending broadcast and waiting for 0xDC responses."""
@@ -701,6 +745,28 @@ class BTAllianceMeshCoordinator(DataUpdateCoordinator):
     def get_infrastructure_state(self, mesh_addr: int) -> Optional[Dict[str, Any]]:
         """Get cached state for a mesh infrastructure node."""
         return self.infrastructure_states.get(mesh_addr)
+
+    def get_gateway_diagnostics(self) -> Dict[str, Any]:
+        """Return diagnostic details for the currently selected BLE gateway."""
+        configured_address = self._format_mac(self.gateway_address)
+        return {
+            "connected": self.connected,
+            "logged_in": self.login_valid,
+            "configured_gateway_address": configured_address,
+            "selected_gateway_address": self.selected_gateway_address,
+            "selected_gateway_name": self.selected_gateway_name,
+            "selected_gateway_rssi": self.selected_gateway_rssi,
+            "gateway_candidates": [
+                self.gateway_candidates[address]
+                for address in sorted(
+                    self.gateway_candidates,
+                    key=lambda item: (
+                        item != configured_address,
+                        -(self.gateway_candidates[item].get("rssi") or -999),
+                    ),
+                )
+            ],
+        }
     
     @staticmethod
     def _format_mac(address: int) -> str:
