@@ -3,52 +3,133 @@
     "step": {
       "user": {
         "title": "BTAlliance Mesh Setup",
-        "description": "Enter your mesh network credentials. The default values work for most Fulife lights.",
+        "description": "Select an advertised network or enter its name. Passive monitor only records public advertisements and needs no gateway or password. Active Alliance networks normally use password 2846. Compatibility and signal strength do not establish device ownership.",
         "data": {
-          "mesh_name": "Mesh Name",
-          "password": "Password"
+          "mesh_name": "Network",
+          "password": "Password (Active Hubs Only)",
+          "excluded_mesh_addresses": "Excluded Light Addresses",
+          "excluded_mac_addresses": "Excluded Bluetooth MAC Addresses",
+          "enrolled_mesh_addresses": "Approved Light Addresses (Approval Mode Only)",
+          "discovery_mode": "Discovery Mode"
         }
       },
       "pick_device": {
         "title": "Select Gateway Device",
-        "description": "Select the Fulife light to use as the mesh gateway. All other lights on the mesh will be discovered automatically.",
+        "description": "Choose a device belonging to your installation on the selected network. Known relays are marked as preferred gateways; lights can also be used if compatible.",
         "data": {
-          "address": "Gateway Device",
-          "mesh_name": "Mesh Name",
-          "password": "Password"
+          "address": "Gateway Device"
         }
       },
       "bluetooth_confirm": {
-        "title": "Confirm BTAlliance Device",
-        "description": "Found {name} at {address}. Configure mesh credentials below.",
+        "title": "Confirm BTAlliance Network",
+        "description": "Found {name} at {address}. Select the network and credentials. Automatic discovery adds responding lights; approval mode limits lights to the approved addresses.",
         "data": {
-          "mesh_name": "Mesh Name",
-          "password": "Password"
+          "mesh_name": "Network",
+          "password": "Password (Active Hubs Only)",
+          "excluded_mesh_addresses": "Excluded Light Addresses",
+          "excluded_mac_addresses": "Excluded Bluetooth MAC Addresses",
+          "enrolled_mesh_addresses": "Approved Light Addresses (Approval Mode Only)",
+          "discovery_mode": "Discovery Mode"
         }
       }
     },
     "abort": {
-      "already_configured": "Device is already configured",
-      "not_supported": "Device is not a supported BTAlliance/Fulife light",
-      "no_devices_found": "No Fulife devices found. Make sure your lights are powered on and in range."
+      "already_configured": "This mesh network is already configured",
+      "not_supported": "Device is not a compatible BTAlliance/Fulife node",
+      "no_devices_found": "No eligible devices are visible on this network. Check power, Bluetooth range, and exclusions."
     },
     "error": {
-      "cannot_connect": "Failed to connect to device",
-      "invalid_auth": "Invalid mesh name or password"
+      "invalid_settings": "Check the network name (1-10 UTF-8 bytes), password (1-16 bytes), mesh addresses (1-254), and comma-separated MAC addresses.",
+      "device_unavailable": "The selected device is no longer visible."
     }
   },
   "options": {
     "step": {
       "init": {
         "title": "BTAlliance Options",
-        "description": "Update mesh network credentials, identify infrastructure addresses, and optionally remove unconfirmed cached lights.",
+        "menu_options": {
+          "settings": "Network Settings and Exclusions",
+          "manage_device": "Manage a Selected Device",
+          "manage_group": "Manage Mesh Groups",
+          "share_settings": "Import Legacy App Settings"
+        }
+      },
+      "settings": {
+        "title": "Network Settings and Exclusions",
+        "description": "Automatic discovery adds responding lights and retains learned devices. Approval mode adds only approved addresses. Use exclusions to prevent rediscovery of unwanted devices. Shared networks may contain devices belonging to other installations. Broadcasts still reach other devices on that network.",
         "data": {
-          "mesh_name": "Mesh Name",
+          "mesh_name": "Network",
           "password": "Password",
           "infrastructure_mesh_addresses": "Infrastructure Mesh Addresses",
-          "cleanup_unvalidated_lights": "Cleanup Unvalidated Lights"
+          "cleanup_unvalidated_lights": "Cleanup Unvalidated Lights",
+          "enrolled_mesh_addresses": "Approved Light Addresses (Approval Mode Only)",
+          "discovery_mode": "Discovery Mode",
+          "excluded_mesh_addresses": "Excluded Light Addresses",
+          "excluded_mac_addresses": "Excluded Bluetooth MAC Addresses"
+        }
+      },
+      "share_settings": {
+        "title": "Receive Legacy App Settings",
+        "description": "Submit to open a five-minute Share Settings import window. Network interfaces are detected automatically. In the legacy app, select Home Assistant in Share Settings and send this network's settings. Any phone on the local LAN can send during this window, so use only on a trusted network. The legacy app protocol is unencrypted and unauthenticated. You will review devices and groups before importing."
+      },
+      "share_wait": {
+        "title": "Waiting for Share Settings",
+        "description": "In the legacy app, open Share Settings and send to Home Assistant. Phone success means received, not imported. This form automatically advances to review; select devices/groups and confirm there to apply names and groups. Listener: {state}. Rejected packets: {rejected}. The listener closes after five minutes or one accepted export. Closing this dialog does not immediately stop the listener; use Stop below. HA also shows a receipt notification. Unconfirmed reviews survive reloads for 24 hours.",
+        "data": {"stop": "Stop Listener and Discard Import"}
+      },
+      "share_preview": {
+        "title": "Review App Import",
+        "description": "Network: {network}. Received {devices} devices and {groups} groups. Select only devices you own; phone inventories can contain stale or neighboring devices. Existing light addresses are preselected. Group members must also be imported devices. Imports retain app names and membership hints, not live status or verified identities. Credentials are ignored. No lighting controls or membership changes are sent; normal discovery resumes after reload. Existing Home Assistant custom names are preserved.",
+        "data": {"devices": "Devices to Import", "groups": "Groups to Import", "confirm": "Confirm Selected Import", "discard": "Discard Received Import"}
+      },
+      "passive_settings": {
+        "title": "Passive Network Monitor",
+        "description": "Records public advertisements only. No authentication, device queries, or control commands are sent. Historical sightings are retained; recent presence means an advertisement was received within five minutes.",
+        "data": {
+          "mesh_name": "Network"
+        }
+      },
+      "manage_group": {
+        "title": "Manage Mesh Groups",
+        "description": "Use group addresses 32769-33022 (the app normally starts at 32785). Creating a control does not change memberships. Reading memberships uses only the selected light. Confirm add/remove changes: duplicate light addresses on a shared network may affect other devices. Groups are not secure networks.",
+        "data": {
+          "operation": "Operation",
+          "group_address": "Group Address",
+          "name": "Group Name",
+          "mesh_address": "Enrolled Light",
+          "confirm": "Confirm Membership Change"
+        }
+      },
+      "manage_device": {
+        "title": "Manage a Selected Device",
+        "description": "Select a device you own by Bluetooth MAC. Destination settings apply only to a move. Factory reset may clear device settings.",
+        "data": {
+          "mac_address": "Device Bluetooth MAC",
+          "operation": "Operation",
+          "new_mesh_name": "Destination Network",
+          "new_password": "Destination Password"
+        }
+      },
+      "confirm_device": {
+        "title": "Confirm Selected Device Operation",
+        "description": "Operation: {operation}. Device: {address}. A network change can disconnect this device from the current hub. If confirmation fails, inspect its network before retrying.",
+        "data": {
+          "confirm": "Confirm This Device Operation"
         }
       }
+    },
+    "abort": {
+      "share_timed_out": "The receiver window expired. Start a new import to try again.",
+      "no_devices_found": "No devices are visible on this hub's network.",
+      "already_configured": "Another hub already uses that network."
+    },
+    "error": {
+      "share_busy": "Another hub has an active listener or pending import. Stop or finish that import first.",
+      "share_start_failed": "Cannot open the receiver. Check Home Assistant's enabled network interfaces and whether another receiver is already running.",
+      "share_invalid_selection": "Confirm the import and select valid devices. Excluded devices, known address collisions, and conflicting MAC identities cannot be imported.",
+      "invalid_settings": "Check the selected device, network name, password, and exclusion lists.",
+      "operation_failed": "The device operation failed or its outcome is uncertain. Inspect the device before retrying; details are recorded in the hub diagnostics and logs.",
+      "group_unconfirmed": "Group membership was not confirmed. Read the light memberships before retrying a change; device settings may already have changed."
     }
   }
 }

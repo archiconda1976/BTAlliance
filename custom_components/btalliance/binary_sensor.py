@@ -18,6 +18,8 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN, CONF_MESH_NAME, BROADCAST_ADDRESS
 from .coordinator import BTAllianceMeshCoordinator
+from .device_info import apply_device_metadata, sync_device_info
+from .passive import PassiveNetworkMonitor
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -31,6 +33,9 @@ async def async_setup_entry(
 ) -> None:
     """Set up BTAlliance infrastructure diagnostic entities."""
     coordinator: BTAllianceMeshCoordinator = hass.data[DOMAIN][entry.entry_id]
+    if isinstance(coordinator, PassiveNetworkMonitor):
+        async_add_entities([BTAlliancePassiveNetwork(coordinator, entry.entry_id)])
+        return
     mesh_name = entry.options.get(CONF_MESH_NAME, entry.data.get(CONF_MESH_NAME, "Fulife"))
     device_registry = dr.async_get(hass)
     hub_device = device_registry.async_get_device(identifiers={(DOMAIN, entry.entry_id)})
@@ -78,6 +83,29 @@ async def async_setup_entry(
             )
 
     async_add_entities(entities)
+
+
+class BTAlliancePassiveNetwork(CoordinatorEntity, BinarySensorEntity):
+    """Recent public advertisements, not an authenticated gateway connection."""
+
+    _attr_has_entity_name = True
+    _attr_name = 'Recent Advertisements'
+    _attr_device_class = BinarySensorDeviceClass.PRESENCE
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: PassiveNetworkMonitor, entry_id: str) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f'{entry_id}_passive_advertisements'
+        self._attr_device_info = DeviceInfo(identifiers={(DOMAIN, entry_id)},
+            name=f'{coordinator.mesh_name} Passive Monitor', model='BLE Mesh Advertisement Monitor')
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.snapshot()['recent_device_count'] > 0
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        return self.coordinator.snapshot()
 
 
 class BTAllianceMeshHubDiagnostics(CoordinatorEntity, BinarySensorEntity):
@@ -148,16 +176,20 @@ class BTAllianceMeshInfrastructureNode(CoordinatorEntity, BinarySensorEntity):
         super().__init__(coordinator)
 
         self._mesh_addr = mesh_addr
+        self._entry_id = entry_id
         self._attr_unique_id = f"{entry_id}_infrastructure_{mesh_addr}"
-        self._attr_name = f"Mesh Node {mesh_addr}"
+        imported_name = getattr(coordinator, 'imported_devices', {}).get(str(mesh_addr), {}).get('name')
+        self._attr_name = None if imported_name else f"Mesh Node {mesh_addr}"
         device_info = DeviceInfo(
             identifiers={(DOMAIN, f"{entry_id}_infrastructure_{mesh_addr}")},
-            name=f"{mesh_name} Mesh Node {mesh_addr}",
+            name=imported_name or f"{mesh_name} Mesh Node {mesh_addr}",
             manufacturer="BTAlliance/Fulife",
             model="Telink BLE Mesh Infrastructure Node",
         )
         if hub_device_id:
             device_info["via_device_id"] = hub_device_id
+        apply_device_metadata(device_info, coordinator.get_device_metadata(mesh_addr),
+                              "Telink BLE Mesh Infrastructure Node")
         self._attr_device_info = device_info
 
         coordinator.register_state_callback(mesh_addr, self._handle_state_update)
@@ -170,6 +202,11 @@ class BTAllianceMeshInfrastructureNode(CoordinatorEntity, BinarySensorEntity):
     @callback
     def _handle_state_update(self) -> None:
         """Handle infrastructure state updates."""
+        apply_device_metadata(self._attr_device_info,
+                              self.coordinator.get_device_metadata(self._mesh_addr),
+                              "Telink BLE Mesh Infrastructure Node")
+        if self.hass:
+            sync_device_info(self.hass, self._entry_id, self._attr_device_info)
         self.async_write_ha_state()
 
     @property
@@ -190,6 +227,7 @@ class BTAllianceMeshInfrastructureNode(CoordinatorEntity, BinarySensorEntity):
         state = self.coordinator.get_infrastructure_state(self._mesh_addr) or {}
         last_seen = state.get("last_seen")
         return {
+            **self.coordinator.get_device_metadata(self._mesh_addr),
             "mesh_address": self._mesh_addr,
             "last_seen": int(last_seen) if last_seen else None,
         }
