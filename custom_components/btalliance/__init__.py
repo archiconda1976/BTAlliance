@@ -9,8 +9,10 @@ import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 
 from .const import (
     DOMAIN,
@@ -19,8 +21,15 @@ from .const import (
     CONF_INFRASTRUCTURE_MESH_ADDRESSES,
     CONF_MESH_NAME,
     CONF_PASSWORD,
+    CONF_EXCLUDED_MESH_ADDRESSES,
+    CONF_EXCLUDED_MAC_ADDRESSES,
+    CONF_DISCOVERY_MODE, DISCOVERY_PASSIVE,
 )
+from .passive import PassiveNetworkMonitor
 from .coordinator import BTAllianceMeshCoordinator
+from .groups import validate_group_address
+from .share_settings import IMPORT_KEY, IMPORT_ENROLLMENT_VERSION, restore_pending_import
+from .discovery import parse_addresses, parse_macs, normalize_mac, validate_network_name, validate_password
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -28,16 +37,19 @@ PLATFORMS: list[Platform] = [Platform.BINARY_SENSOR, Platform.BUTTON, Platform.L
 
 
 BROADCAST_RGB_SCHEMA = vol.Schema({
+    vol.Optional("entry_id"): str,
     vol.Required("red"): vol.All(vol.Coerce(int), vol.Range(min=0, max=255)),
     vol.Required("green"): vol.All(vol.Coerce(int), vol.Range(min=0, max=255)),
     vol.Required("blue"): vol.All(vol.Coerce(int), vol.Range(min=0, max=255)),
 })
 
 BROADCAST_BRIGHTNESS_SCHEMA = vol.Schema({
+    vol.Optional("entry_id"): str,
     vol.Required("brightness"): vol.All(vol.Coerce(int), vol.Range(min=0, max=255)),
 })
 
 BROADCAST_COLOR_TEMP_SCHEMA = vol.Schema({
+    vol.Optional("entry_id"): str,
     vol.Required("color_temp_pct"): vol.All(vol.Coerce(int), vol.Range(min=0, max=100)),
 })
 
@@ -82,13 +94,18 @@ async def _get_coordinator(
 ) -> BTAllianceMeshCoordinator:
     """Return the coordinator to use for a service call."""
     coordinators = hass.data.get(DOMAIN, {})
-
-    if len(coordinators) == 1:
-        return next(iter(coordinators.values()))
-
     entry_id = call.data.get("entry_id")
+    if entry_id in coordinators and isinstance(coordinators[entry_id], PassiveNetworkMonitor):
+        raise HomeAssistantError('Passive monitors cannot send device commands')
     if entry_id and entry_id in coordinators:
         return coordinators[entry_id]
+    if entry_id:
+        raise HomeAssistantError("Unknown BTAlliance hub entry_id")
+    active = [hub for hub in coordinators.values() if not isinstance(hub, PassiveNetworkMonitor)]
+    if len(active) == 1:
+        return active[0]
+    if not active:
+        raise HomeAssistantError('No active BTAlliance hub is configured')
 
     raise ValueError(
         "Multiple BTAlliance hubs are configured; provide entry_id."
@@ -98,6 +115,23 @@ async def _get_coordinator(
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up BTAlliance Mesh Lights from a config entry."""
     _LOGGER.debug("Setting up BTAlliance entry: %s", entry.entry_id)
+
+    if entry.options.get(CONF_DISCOVERY_MODE, entry.data.get(CONF_DISCOVERY_MODE)) == DISCOVERY_PASSIVE:
+        monitor = PassiveNetworkMonitor(hass, entry)
+        hass.data.setdefault(DOMAIN, {})[entry.entry_id] = monitor
+        await monitor.async_start()
+        await hass.config_entries.async_forward_entry_setups(entry, [Platform.BINARY_SENSOR])
+        async def reload_passive_options(hass, updated):
+            if updated.options.get(CONF_MESH_NAME, updated.data[CONF_MESH_NAME]) != monitor.mesh_name:
+                await hass.config_entries.async_reload(updated.entry_id)
+        entry.async_on_unload(entry.add_update_listener(reload_passive_options))
+        return True
+
+    # Discard the obsolete manual/app-export type cache, preserving learned identities.
+    if 'cached_device_types' in entry.options:
+        options = dict(entry.options)
+        options.pop('cached_device_types')
+        hass.config_entries.async_update_entry(entry, options=options)
 
     gateway_address = entry.data[CONF_GATEWAY_ADDRESS]
     mesh_name = entry.options.get(CONF_MESH_NAME, entry.data[CONF_MESH_NAME])
@@ -115,6 +149,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
     )
 
+    if entry.options.get(IMPORT_KEY) and entry.options.get(IMPORT_ENROLLMENT_VERSION) != 1:
+        # Preserve persisted enrollment; old import metadata is not a new grant.
+        options = dict(entry.options)
+        options[IMPORT_ENROLLMENT_VERSION] = 1
+        if entry.options[IMPORT_KEY].get('mesh_name') == mesh_name:
+            prefix = f'{entry.entry_id}_infrastructure_'
+            for registered in er.async_entries_for_config_entry(er.async_get(hass), entry.entry_id):
+                if registered.domain != 'binary_sensor' or not registered.unique_id.startswith(prefix):
+                    continue
+                try:
+                    address = int(registered.unique_id.removeprefix(prefix))
+                except ValueError:
+                    continue
+                if 1 <= address <= 254:
+                    infrastructure_mesh_addresses.add(address)
+            options[CONF_INFRASTRUCTURE_MESH_ADDRESSES] = ','.join(map(str, sorted(infrastructure_mesh_addresses)))
+        hass.config_entries.async_update_entry(entry, options=options)
+
     coordinator = BTAllianceMeshCoordinator(
         hass=hass,
         entry=entry,
@@ -123,10 +175,87 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         password=password,
         infrastructure_mesh_addresses=infrastructure_mesh_addresses,
         cached_light_mesh_addresses=cached_light_mesh_addresses,
+        excluded_mesh_addresses=parse_addresses(entry.options.get(CONF_EXCLUDED_MESH_ADDRESSES, entry.data.get(CONF_EXCLUDED_MESH_ADDRESSES, ""))),
+        excluded_mac_addresses=parse_macs(entry.options.get(CONF_EXCLUDED_MAC_ADDRESSES, entry.data.get(CONF_EXCLUDED_MAC_ADDRESSES, ""))),
     )
 
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = coordinator
+    restore_pending_import(hass, entry, mesh_name)
+
+    settings_keys = (CONF_MESH_NAME, CONF_PASSWORD, CONF_INFRASTRUCTURE_MESH_ADDRESSES,
+                     CONF_EXCLUDED_MESH_ADDRESSES, CONF_EXCLUDED_MAC_ADDRESSES, "enrolled_mesh_addresses", "discovery_mode", IMPORT_KEY)
+    settings = {key: entry.options.get(key, entry.data.get(key, "")) for key in settings_keys}
+
+    async def update_options(hass: HomeAssistant, updated: ConfigEntry) -> None:
+        effective = {key: updated.options.get(key, updated.data.get(key, "")) for key in settings_keys}
+        if effective != settings:
+            await hass.config_entries.async_reload(updated.entry_id)
+
+    entry.async_on_unload(entry.add_update_listener(update_options))
+
+    async def handle_device_operation(call: ServiceCall) -> dict[str, Any]:
+        hub = await _get_coordinator(hass, call)
+        operation = {"move_device_to_network": "move", "reset_device_to_factory": "reset", "refresh_device_metadata": "inspect"}[call.service]
+        if operation != "inspect" and not call.data["confirm"]:
+            raise HomeAssistantError("Explicit confirmation is required for a device network change")
+        return await hub.async_manage_device(call.data["mac_address"], operation,
+                                             call.data.get("new_mesh_name"), call.data.get("new_password", "2846"))
+
+    async def handle_query_firmware(call: ServiceCall) -> None:
+        hub = await _get_coordinator(hass, call)
+        if not await hub.async_query_firmware(call.data["mesh_address"]):
+            raise HomeAssistantError("Firmware query could not be sent")
+
+    async def handle_group(call: ServiceCall) -> dict[str, Any]:
+        hub = await _get_coordinator(hass, call)
+        if call.service == 'configure_group':
+            hub.configure_group(call.data['group_address'], call.data['name'])
+            return hub.get_group_metadata(call.data['group_address'])
+        address = call.data['mesh_address']
+        if call.service == 'query_light_groups':
+            groups = await hub.async_query_groups(address)
+            return {'mesh_address': address, 'group_addresses': sorted(groups) if groups is not None else None,
+                    'confirmed': groups is not None}
+        if not call.data['confirm']:
+            raise HomeAssistantError('Confirm the membership change; duplicate mesh addresses can affect other devices')
+        await hub.async_set_group_membership(address, call.data['group_address'], call.service == 'add_light_to_group')
+        return dict(hub.last_group_operation)
+
+    group_schema = {vol.Optional('entry_id'): str,
+                    vol.Required('group_address'): validate_group_address,
+                    vol.Required('mesh_address'): vol.All(vol.Coerce(int), vol.Range(min=1, max=254)),
+                    vol.Required('confirm'): bool}
+    for service in ('add_light_to_group', 'remove_light_from_group'):
+        if not hass.services.has_service(DOMAIN, service):
+            hass.services.async_register(DOMAIN, service, handle_group, schema=vol.Schema(group_schema),
+                                         supports_response=SupportsResponse.OPTIONAL)
+    for service, schema in (
+        ('configure_group', {vol.Optional('entry_id'): str, vol.Required('group_address'): validate_group_address,
+                             vol.Required('name'): vol.All(str, vol.Length(min=1, max=80))}),
+        ('query_light_groups', {vol.Optional('entry_id'): str,
+                               vol.Required('mesh_address'): vol.All(vol.Coerce(int), vol.Range(min=1, max=254))}),
+    ):
+        if not hass.services.has_service(DOMAIN, service):
+            hass.services.async_register(DOMAIN, service, handle_group, schema=vol.Schema(schema),
+                                         supports_response=SupportsResponse.OPTIONAL)
+
+    device_schema = {vol.Optional("entry_id"): str, vol.Required("mac_address"): normalize_mac}
+    for name in ("move_device_to_network", "reset_device_to_factory", "refresh_device_metadata"):
+        schema = dict(device_schema)
+        if name != "refresh_device_metadata":
+            schema[vol.Required("confirm")] = bool
+        if name == "move_device_to_network":
+            schema[vol.Required("new_mesh_name")] = validate_network_name
+            schema[vol.Optional("new_password", default="2846")] = validate_password
+        if not hass.services.has_service(DOMAIN, name):
+            hass.services.async_register(DOMAIN, name, handle_device_operation,
+                                         schema=vol.Schema(schema), supports_response=SupportsResponse.OPTIONAL)
+    if not hass.services.has_service(DOMAIN, "query_device_firmware"):
+        hass.services.async_register(DOMAIN, "query_device_firmware", handle_query_firmware, schema=vol.Schema({
+            vol.Optional("entry_id"): str,
+            vol.Required("mesh_address"): vol.All(vol.Coerce(int), vol.Range(min=1, max=254)),
+        }))
 
     device_registry = dr.async_get(hass)
     device_registry.async_get_or_create(
@@ -259,16 +388,20 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     _LOGGER.debug("Unloading BTAlliance entry: %s", entry.entry_id)
 
+    passive = entry.data.get(CONF_DISCOVERY_MODE) == DISCOVERY_PASSIVE
     unload_ok = await hass.config_entries.async_unload_platforms(
         entry,
-        PLATFORMS,
+        [Platform.BINARY_SENSOR] if passive else PLATFORMS,
     )
 
     if unload_ok:
         coordinator: BTAllianceMeshCoordinator = hass.data[DOMAIN].pop(
             entry.entry_id
         )
-        await coordinator.async_disconnect()
+        if isinstance(coordinator, PassiveNetworkMonitor):
+            await coordinator.async_stop()
+        else:
+            await coordinator.async_disconnect()
 
     return unload_ok
 

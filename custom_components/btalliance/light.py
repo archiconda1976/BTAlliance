@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any
+from collections.abc import Callable
 
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
@@ -16,6 +17,7 @@ from homeassistant.components.light import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
@@ -24,6 +26,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN, CONF_MESH_NAME, BROADCAST_ADDRESS, MAX_CONNECTION_RETRIES
 from .coordinator import BTAllianceMeshCoordinator
+from .device_info import apply_device_metadata, sync_device_info
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -35,7 +38,9 @@ async def async_setup_entry(
 ) -> None:
     """Set up BTAlliance lights from a config entry."""
     coordinator: BTAllianceMeshCoordinator = hass.data[DOMAIN][entry.entry_id]
-    mesh_name = entry.data.get(CONF_MESH_NAME, "Fulife")
+    mesh_name = coordinator.mesh_name
+    coordinator.refresh_advertisement_metadata()
+    coordinator.apply_exclusions(coordinator.excluded_mesh_addresses, coordinator.excluded_mac_addresses)
     device_registry = dr.async_get(hass)
     hub_device = device_registry.async_get_device(identifiers={(DOMAIN, entry.entry_id)})
     hub_device_id = hub_device.id if hub_device else None
@@ -58,11 +63,15 @@ async def async_setup_entry(
         except ValueError:
             continue
 
+        if mesh_addr not in coordinator.enrolled_mesh_addresses or coordinator.is_excluded_address(mesh_addr):
+            coordinator._remove_light_entity_and_device(mesh_addr)
+            continue
+
         coordinator.add_cached_light_address(mesh_addr)
     
     def add_new_device(mesh_addr: int) -> None:
         """Add a new light entity for a discovered mesh device."""
-        if coordinator.is_infrastructure_address(mesh_addr):
+        if not coordinator._is_controllable_light_address(mesh_addr):
             _LOGGER.info(
                 "Mesh address %d is configured as infrastructure; not adding a light entity",
                 mesh_addr,
@@ -82,6 +91,7 @@ async def async_setup_entry(
                 mesh_name=mesh_name,
                 entry_id=entry.entry_id,
                 hub_device_id=hub_device_id,
+                on_forget=lambda: known_addresses.discard(mesh_addr),
             )
         ])
     
@@ -100,6 +110,18 @@ async def async_setup_entry(
 
     for mesh_addr in sorted(coordinator.cached_light_mesh_addresses):
         add_new_device(mesh_addr)
+
+    known_groups: set[int] = set()
+
+    def add_group(address: int) -> None:
+        if address not in known_groups:
+            known_groups.add(address)
+            async_add_entities([BTAllianceGroupLight(coordinator, address, mesh_name, entry.entry_id, hub_device_id)])
+
+    coordinator._new_group_callback = add_group
+    entry.async_on_unload(lambda: setattr(coordinator, '_new_group_callback', None))
+    for address in sorted(coordinator.mesh_groups):
+        add_group(address)
     
     # Start connection and discovery in background task to avoid blocking startup
     async def connect_and_discover() -> None:
@@ -131,6 +153,12 @@ async def async_setup_entry(
 
             _LOGGER.info("Refreshing full status for cached mesh light %d", mesh_addr)
             await coordinator.async_query_status(mesh_addr)
+            if mesh_addr not in coordinator._firmware_requested:
+                await coordinator.async_query_firmware(mesh_addr)
+            try:
+                await coordinator.async_query_groups(mesh_addr)
+            except HomeAssistantError as err:
+                _LOGGER.warning('Group discovery skipped for light %d: %s', mesh_addr, err)
             await asyncio.sleep(0.5)
         
         # Log what we found
@@ -161,6 +189,7 @@ class BTAllianceMeshLight(CoordinatorEntity, LightEntity):
         mesh_name: str,
         entry_id: str,
         hub_device_id: str | None,
+        on_forget: Callable[[], None] | None = None,
     ) -> None:
         """Initialize the light."""
         super().__init__(coordinator)
@@ -168,20 +197,23 @@ class BTAllianceMeshLight(CoordinatorEntity, LightEntity):
         self._mesh_addr = mesh_addr
         self._mesh_name = mesh_name
         self._entry_id = entry_id
+        self._on_forget = on_forget
         
         # Entity IDs
         self._attr_unique_id = f"{entry_id}_{mesh_addr}"
-        self._attr_name = f"Light {mesh_addr}"
+        imported_name = getattr(coordinator, 'imported_devices', {}).get(str(mesh_addr), {}).get('name')
+        self._attr_name = None if imported_name else f"Light {mesh_addr}"
         
         # Device info - group all lights under the mesh network
         device_info = DeviceInfo(
             identifiers={(DOMAIN, f"{entry_id}_{mesh_addr}")},
-            name=f"{mesh_name} Light {mesh_addr}",
+            name=imported_name or f"{mesh_name} Light {mesh_addr}",
             manufacturer="BTAlliance/Fulife",
             model="Telink BLE Mesh Light",
         )
         if hub_device_id:
             device_info["via_device_id"] = hub_device_id
+        apply_device_metadata(device_info, coordinator.get_device_metadata(mesh_addr), "Telink BLE Mesh Light")
         self._attr_device_info = device_info
         
         # Register for state updates
@@ -194,11 +226,19 @@ class BTAllianceMeshLight(CoordinatorEntity, LightEntity):
 
     async def async_removed_from_registry(self) -> None:
         """Handle manual removal from the entity registry."""
-        self.coordinator.remove_cached_light_address(self._mesh_addr)
+        if self._on_forget is not None:
+            self._on_forget()
+        self.coordinator.forget_light_address(self._mesh_addr)
     
     @callback
     def _handle_state_update(self) -> None:
         """Handle state update from coordinator."""
+        if 1 <= self._mesh_addr <= 254:
+            apply_device_metadata(self._attr_device_info,
+                                  self.coordinator.get_device_metadata(self._mesh_addr),
+                                  "Telink BLE Mesh Light")
+            if self.hass:
+                sync_device_info(self.hass, self._entry_id, self._attr_device_info)
         self.async_write_ha_state()
     
     @property
@@ -208,6 +248,11 @@ class BTAllianceMeshLight(CoordinatorEntity, LightEntity):
         if state:
             return state.get('is_on', False)
         return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Network, physical identity, and firmware details for a mesh light."""
+        return self.coordinator.get_device_metadata(self._mesh_addr)
     
     @property
     def brightness(self) -> int | None:
@@ -293,6 +338,80 @@ class BTAllianceMeshLight(CoordinatorEntity, LightEntity):
     async def async_update(self) -> None:
         """Fetch new state data for this light."""
         await self.coordinator.async_query_status(self._mesh_addr)
+
+
+class BTAllianceGroupLight(BTAllianceMeshLight):
+    """Native mesh group controls, backed by reported member states."""
+
+    _attr_has_entity_name = False
+
+    def __init__(self, coordinator, mesh_addr, mesh_name, entry_id, hub_device_id):
+        super().__init__(coordinator, mesh_addr, mesh_name, entry_id, hub_device_id)
+        self._attr_unique_id = f'{entry_id}_group_{mesh_addr}'
+        self._attr_name = coordinator.mesh_groups[mesh_addr]['name']
+        device = DeviceInfo(identifiers={(DOMAIN, self._attr_unique_id)},
+                            name=f"{mesh_name} {self._attr_name}", manufacturer='BTAlliance/Fulife',
+                            model='Telink Mesh Group')
+        if hub_device_id:
+            device['via_device_id'] = hub_device_id
+        self._attr_device_info = device
+
+    @property
+    def name(self):
+        return f"{self._mesh_name} {self.coordinator.mesh_groups[self._mesh_addr]['name']}"
+
+    @property
+    def available(self):
+        return self.coordinator.login_valid and bool(self.coordinator.get_group_members(self._mesh_addr))
+
+    @property
+    def extra_state_attributes(self):
+        return self.coordinator.get_group_metadata(self._mesh_addr)
+
+    @property
+    def color_mode(self):
+        state = self.coordinator.get_light_state(self._mesh_addr)
+        return state.get('color_mode') if state else None
+
+    @property
+    def color_temp_kelvin(self):
+        state = self.coordinator.get_light_state(self._mesh_addr)
+        percent = state.get('color_temp') if state else None
+        if percent is not None and 0 <= percent <= 100:
+            return 2700 + int(percent * 3800 / 100)
+        return None
+
+    async def async_removed_from_registry(self):
+        """Removing an HA entity must not alter mesh membership."""
+
+    async def async_turn_on(self, **kwargs):
+        if not self.coordinator.get_group_members(self._mesh_addr):
+            raise HomeAssistantError('Add a confirmed enrolled member before controlling this group')
+        operations = []
+        if ATTR_RGB_COLOR in kwargs:
+            operations.append(self.coordinator.async_set_rgb(self._mesh_addr, *kwargs[ATTR_RGB_COLOR]))
+        elif ATTR_COLOR_TEMP_KELVIN in kwargs:
+            percent = max(0, min(100, int((kwargs[ATTR_COLOR_TEMP_KELVIN] - 2700) * 100 / 3800)))
+            operations.append(self.coordinator.async_set_color_temp(self._mesh_addr, percent))
+        if ATTR_BRIGHTNESS in kwargs:
+            operations.append(self.coordinator.async_set_brightness(self._mesh_addr, kwargs[ATTR_BRIGHTNESS]))
+        if not operations:
+            operations.append(self.coordinator.async_turn_on(self._mesh_addr))
+        results = await asyncio.gather(*operations)
+        if not all(results):
+            raise HomeAssistantError('A mesh group command could not be sent')
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs):
+        if not self.coordinator.get_group_members(self._mesh_addr):
+            raise HomeAssistantError('Add a confirmed enrolled member before controlling this group')
+        if not await self.coordinator.async_turn_off(self._mesh_addr):
+            raise HomeAssistantError('The mesh group command could not be sent')
+        self.async_write_ha_state()
+
+    async def async_update(self):
+        for address in sorted(self.coordinator.get_group_members(self._mesh_addr)):
+            await self.coordinator.async_query_status(address)
 
 
 class BTAllianceBroadcastLight(BTAllianceMeshLight):

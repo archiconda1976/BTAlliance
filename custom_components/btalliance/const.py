@@ -22,6 +22,10 @@ COMMAND_SET_RGB_LUM: Final = 0xE2
 COMMAND_SET_CT_LUM: Final = 0xE2
 COMMAND_QUERY_STATUS: Final = 0xDA
 COMMAND_SET_DATETIME: Final = 0xE4
+COMMAND_QUERY_FIRMWARE: Final = 0xC7
+NOTIFY_FIRMWARE: Final = 0xC8
+FIRMWARE_UUID: Final = "00002a26-0000-1000-8000-00805f9b34fb"
+DEFAULT_LONG_TERM_KEY: Final = bytes.fromhex("c0c1c2c3c4c5c6c7d8d9dadbdcdddedf")
 
 # Notification opcodes
 NOTIFY_LIGHT_STATUS: Final = 0xDC
@@ -56,6 +60,18 @@ CONF_GATEWAY_ADDRESS: Final = "gateway_address"
 CONF_INFRASTRUCTURE_MESH_ADDRESSES: Final = "infrastructure_mesh_addresses"
 CONF_DISCOVERED_LIGHT_MESH_ADDRESSES: Final = "discovered_light_mesh_addresses"
 CONF_CLEANUP_UNVALIDATED_LIGHTS: Final = "cleanup_unvalidated_lights"
+CONF_EXCLUDED_MESH_ADDRESSES: Final = "excluded_mesh_addresses"
+CONF_EXCLUDED_MAC_ADDRESSES: Final = "excluded_mac_addresses"
+CONF_DEVICE_METADATA: Final = "device_metadata"
+CONF_ENROLLED_MESH_ADDRESSES: Final = "enrolled_mesh_addresses"
+CONF_DISCOVERY_MODE: Final = "discovery_mode"
+DISCOVERY_AUTOMATIC: Final = "automatic"
+DISCOVERY_APPROVAL: Final = "approval"
+DISCOVERY_PASSIVE: Final = "passive"
+CONF_MESH_GROUPS: Final = "mesh_groups"
+COMMAND_GROUP_MEMBERSHIP: Final = 0xD7
+COMMAND_QUERY_GROUPS: Final = 0xDD
+NOTIFY_GROUPS: Final = 0xD4
 
 # BLE advertisement matching
 FULIFE_MAC_PREFIXES: Final = ["FF:00:06:0E", "FF:05:01:0B"]

@@ -1,23 +1,47 @@
 broadcast_turn_on:
   name: Broadcast Turn On
   description: Turn on all BTAlliance mesh lights with a single mesh broadcast.
+  fields:
+    entry_id:
+      name: Hub Entry ID
+      selector:
+        text:
 
 broadcast_turn_off:
   name: Broadcast Turn Off
   description: Turn off all BTAlliance mesh lights with a single mesh broadcast.
+  fields:
+    entry_id:
+      name: Hub Entry ID
+      selector:
+        text:
 
 broadcast_query_status:
   name: Broadcast Query Status
   description: Request status from all BTAlliance mesh lights.
+  fields:
+    entry_id:
+      name: Hub Entry ID
+      selector:
+        text:
 
 broadcast_sync_time:
   name: Broadcast Sync Time
   description: Sync date and time to all BTAlliance mesh lights.
+  fields:
+    entry_id:
+      name: Hub Entry ID
+      selector:
+        text:
 
 broadcast_set_brightness:
   name: Broadcast Set Brightness
   description: Set brightness for all BTAlliance mesh lights.
   fields:
+    entry_id:
+      name: Hub Entry ID
+      selector:
+        text:
     brightness:
       name: Brightness
       description: Brightness from 0-255.
@@ -32,6 +56,10 @@ broadcast_set_rgb:
   name: Broadcast Set RGB
   description: Set RGB color for all BTAlliance mesh lights.
   fields:
+    entry_id:
+      name: Hub Entry ID
+      selector:
+        text:
     red:
       name: Red
       required: true
@@ -58,6 +86,10 @@ broadcast_set_color_temp:
   name: Broadcast Set Color Temperature
   description: Set color temperature for all BTAlliance mesh lights.
   fields:
+    entry_id:
+      name: Hub Entry ID
+      selector:
+        text:
     color_temp_pct:
       name: Color Temperature
       description: Percentage from warm (0) to cool (100).
@@ -91,3 +123,182 @@ cleanup_discovered_lights:
       default: true
       selector:
         boolean:
+
+move_device_to_network:
+  name: Move Device to Network
+  description: Directly change one selected Bluetooth device's network. Uses current hub credentials; no mesh broadcast or address change. Pairing confirmation does not prove reconnection.
+  fields:
+    entry_id:
+      name: Hub Entry ID
+      selector:
+        text:
+    mac_address:
+      name: Device Bluetooth MAC
+      required: true
+      selector:
+        text:
+    new_mesh_name:
+      name: Destination Network
+      required: true
+      selector:
+        text:
+    new_password:
+      name: Destination Password
+      default: "2846"
+      selector:
+        text:
+          type: password
+    confirm:
+      name: Confirm Device Network Change
+      required: true
+      selector:
+        boolean:
+
+reset_device_to_factory:
+  name: Reset Device to Factory Network
+  description: Send a direct pairing-delete request to one selected Bluetooth MAC. Factory reset can clear device settings. Authentication to its current network is required.
+  fields:
+    entry_id:
+      name: Hub Entry ID
+      selector:
+        text:
+    mac_address:
+      name: Device Bluetooth MAC
+      required: true
+      selector:
+        text:
+    confirm:
+      name: Confirm Factory Reset
+      required: true
+      selector:
+        boolean:
+
+refresh_device_metadata:
+  name: Read Device Firmware Revision
+  description: Read the standard firmware revision from a selected Bluetooth device. Pauses and disconnects the hub gateway during the read.
+  fields:
+    entry_id:
+      name: Hub Entry ID
+      selector:
+        text:
+    mac_address:
+      name: Device Bluetooth MAC
+      required: true
+      selector:
+        text:
+
+configure_group:
+  name: Configure mesh group
+  description: Create or rename a native group control. This does not change device memberships or isolate the network.
+  fields:
+    entry_id:
+      name: Hub entry ID
+      selector:
+        text:
+    group_address:
+      name: Group address
+      required: true
+      selector:
+        number:
+          min: 32769
+          max: 33022
+          mode: box
+    name:
+      name: Group name
+      required: true
+      selector:
+        text:
+
+query_light_groups:
+  name: Read light group memberships
+  description: Request memberships from one enrolled light. Timeout or incomplete replies do not clear cached memberships.
+  fields:
+    entry_id:
+      name: Hub entry ID
+      selector:
+        text:
+    mesh_address:
+      name: Light mesh address
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 254
+          mode: box
+
+add_light_to_group:
+  name: Add light to mesh group
+  description: Add one enrolled light and verify its membership. Duplicate light addresses on a shared network may affect other devices. Confirmation is required.
+  fields:
+    entry_id:
+      name: Hub entry ID
+      selector:
+        text:
+    mesh_address:
+      name: Light mesh address
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 254
+          mode: box
+    group_address:
+      name: Group address
+      required: true
+      selector:
+        number:
+          min: 32769
+          max: 33022
+          mode: box
+    confirm:
+      name: Confirm membership change
+      required: true
+      selector:
+        boolean:
+
+remove_light_from_group:
+  name: Remove light from mesh group
+  description: Remove one enrolled light and verify its membership. Does not reset the light or delete the group control. Duplicate addresses may affect other devices.
+  fields:
+    entry_id:
+      name: Hub entry ID
+      selector:
+        text:
+    mesh_address:
+      name: Light mesh address
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 254
+          mode: box
+    group_address:
+      name: Group address
+      required: true
+      selector:
+        number:
+          min: 32769
+          max: 33022
+          mode: box
+    confirm:
+      name: Confirm membership change
+      required: true
+      selector:
+        boolean:
+
+query_device_firmware:
+  name: Query Device Firmware Name
+  description: Request a firmware name over the mesh. Updates attributes when a reply arrives; does not create a light or change its network.
+  fields:
+    entry_id:
+      name: Hub Entry ID
+      selector:
+        text:
+    mesh_address:
+      name: Mesh Address
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 254
+          mode: box

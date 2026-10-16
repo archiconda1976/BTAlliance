@@ -2,6 +2,8 @@
 
 import datetime
 import logging
+import hmac
+import re
 from typing import Optional
 
 from .const import (
@@ -10,6 +12,10 @@ from .const import (
     NOTIFY_STATUS_RESPONSE, NOTIFY_LIGHT_STATUS,
     MODE_RGB, MODE_COLOR_TEMP, VENDOR_ID, BROADCAST_ADDRESS
 )
+from .const import COMMAND_QUERY_FIRMWARE, NOTIFY_FIRMWARE, DEFAULT_LONG_TERM_KEY
+from .const import COMMAND_GROUP_MEMBERSHIP, COMMAND_QUERY_GROUPS, NOTIFY_GROUPS
+from .groups import validate_group_address
+from .discovery import validate_network_name, validate_password
 from .crypto import TelinkCrypto
 
 _LOGGER = logging.getLogger(__name__)
@@ -101,6 +107,53 @@ class TelinkProtocol:
         data = self._build_command_frame(COMMAND_ON_OFF)
         data[10] = 0x01 if state else 0x00
         return self._encrypt_command(data)
+
+    def generate_firmware_query(self) -> bytearray:
+        """Request the firmware identifier using the app's C7/10 query."""
+        data = self._build_command_frame(COMMAND_QUERY_FIRMWARE)
+        data[10:12] = bytes([0x10, 0x00])
+        return self._encrypt_command(data)
+
+    def generate_group_query(self) -> bytearray:
+        """Request short group memberships using the app's DD/08/01 query."""
+        data = self._build_command_frame(COMMAND_QUERY_GROUPS)
+        data[10:12] = b'\x08\x01'
+        return self._encrypt_command(data)
+
+    def generate_group_membership(self, group_address: int, add: bool) -> bytearray:
+        """Assign/remove a group on the target individual mesh device."""
+        group_address = validate_group_address(group_address)
+        if not 1 <= self.get_target_address() <= 254:
+            raise ValueError("Membership changes require an individual device address")
+        data = self._build_command_frame(COMMAND_GROUP_MEMBERSHIP)
+        data[10:13] = bytes([int(add), group_address & 0xFF, group_address >> 8])
+        return self._encrypt_command(data)
+
+    def generate_network_packets(self, name: str, password: str) -> list[bytes]:
+        """Pairing-characteristic writes; reuse the established AES primitives."""
+        validate_network_name(name)
+        validate_password(password)
+        if self.session_key is None:
+            raise RuntimeError("Session key not established")
+        values = [TelinkCrypto.pad_string(name, 16), TelinkCrypto.pad_string(password, 16), DEFAULT_LONG_TERM_KEY]
+        return [bytes([opcode]) + bytes(TelinkCrypto.aes_att_encryption(self.session_key, value))
+                for opcode, value in zip((0x04, 0x05, 0x06), values, strict=True)]
+
+    def validate_network_confirmation(self, response: bytes, name: str, password: str) -> bool:
+        """Verify the app's encrypted name/password/LTK confirmation."""
+        if self.session_key is None or len(response) != 17 or response[0] != 0x07:
+            return False
+        name_bytes = TelinkCrypto.pad_string(name, 16)
+        password_bytes = TelinkCrypto.pad_string(password, 16)
+        plaintext = bytes(a ^ b ^ c for a, b, c in zip(name_bytes, password_bytes, DEFAULT_LONG_TERM_KEY, strict=True))
+        expected = TelinkCrypto.aes_att_encryption(self.session_key, plaintext)
+        return hmac.compare_digest(response[1:], bytes(expected))
+
+    def generate_factory_reset_packet(self, random: bytes) -> bytes:
+        """Direct pairing delete, never a routed mesh reset or broadcast."""
+        if len(random) != 8:
+            raise ValueError("Pairing random must contain eight bytes")
+        return bytes([0x0A]) + bytes(self.generate_login_payload(random))
     
     def generate_luminance_command(self, level: int) -> bytearray:
         """Generate luminance command (0-100)."""
@@ -151,7 +204,7 @@ class TelinkProtocol:
     
     def parse_notification(self, data: bytearray) -> Optional[dict]:
         """Parse and decrypt notification data."""
-        if self.session_key is None:
+        if self.session_key is None or len(data) != 20:
             return None
         
         nonce = TelinkCrypto.get_nonce_ivs(self.mac_bytes)
@@ -162,18 +215,30 @@ class TelinkProtocol:
         except Exception:
             return None
         
-        if decrypted is None:
+        if decrypted is None or int.from_bytes(decrypted[8:10], "big") != VENDOR_ID:
             return None
         
         opcode = decrypted[7]
         result = {
             'opcode': opcode,
             'source': int.from_bytes(decrypted[3:5], "little"),
-            'destination': int.from_bytes(decrypted[5:7], "little"),
+            'mic': bytes(decrypted[5:7]).hex(),
             'raw': decrypted,
         }
         
-        if opcode == NOTIFY_STATUS_RESPONSE:
+        if opcode == NOTIFY_GROUPS:
+            groups = []
+            terminated = False
+            for group_id in decrypted[10:20]:
+                if group_id == 0xFF:
+                    terminated = True
+                    break
+                if group_id:
+                    groups.append(0x8000 | group_id)
+            result['group_addresses'] = sorted(set(groups))
+            result['groups_complete'] = terminated
+
+        elif opcode == NOTIFY_STATUS_RESPONSE:
             result['red'] = decrypted[10]
             result['green'] = decrypted[11]
             result['blue'] = decrypted[12]
@@ -184,13 +249,25 @@ class TelinkProtocol:
             result['is_on'] = result['luminance'] > 0 or result['warm'] > 0 or result['cool'] > 0
             
         elif opcode == NOTIFY_LIGHT_STATUS:
-            light_addr = decrypted[10]
-            lum_byte = decrypted[12]
-            is_on = lum_byte not in (0x00, 0xFF)
-            luminance = lum_byte if lum_byte != 0xFF else 0
-            
-            result['light_addr'] = light_addr
-            result['is_on'] = is_on
-            result['luminance'] = luminance
+            records = []
+            for offset in (10, 14):
+                address, counter, luminance, auxiliary = decrypted[offset:offset + 4]
+                if address == 0 or (address == 255 and luminance == 255):
+                    break
+                if not 1 <= address <= 254:
+                    continue
+                records.append({
+                    'light_addr': address, 'status_counter': counter,
+                    'online': counter != 0, 'is_on': counter != 0 and luminance > 0,
+                    'luminance': luminance, 'auxiliary': auxiliary,
+                })
+            result['records'] = records
+            if records:
+                result.update(records[0])
+
+        elif opcode == NOTIFY_FIRMWARE:
+            name = bytes(decrypted[14:20]).rstrip(b"\x00").decode("ascii", errors="ignore")
+            if re.fullmatch(r"[A-Za-z0-9]{1,6}", name):
+                result['firmware_name'] = name
         
         return result
